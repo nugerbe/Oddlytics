@@ -203,6 +203,17 @@ namespace OddsTracker.Core.Services
 
         #endregion
 
+        #region Signals
+
+        // In EnhancedCacheService
+        public async Task<List<SignalSnapshot>?> GetSignalsForEventAsync(string eventId, string marketKey) =>
+            await GetAsync<List<SignalSnapshot>>($"signals:{eventId}:{marketKey}");
+
+        public async Task SetSignalsForEventAsync(string eventId, string marketKey, List<SignalSnapshot> signals) =>
+            await SetAsync($"signals:{eventId}:{marketKey}", signals, TimeSpan.FromMinutes(15));
+
+        #endregion
+
         #region Invalidation
 
         public async Task InvalidateMarketAsync(string eventId, string marketKey)

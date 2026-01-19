@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OddsTracker.Core.Interfaces;
 using OddsTracker.Core.Models;
@@ -7,6 +8,7 @@ using System.Text;
 namespace OddsTracker.Core.Services
 {
     public class OddsOrchestrator(
+        IServiceScopeFactory scopeFactory,
         IQueryParser localParser,
         IClaudeService claudeService,
         IOddsService oddsService,
@@ -148,6 +150,36 @@ namespace OddsTracker.Core.Services
             }
 
             return charts;
+        }
+
+        private async Task<List<SignalSnapshot>> GetSignalsCachedAsync(string eventId, string marketKey)
+        {
+            var cacheKey = $"signals:{eventId}:{marketKey}";
+
+            var cached = await cacheService.GetAsync<List<SignalSnapshot>>(cacheKey);
+            if (cached is not null)
+                return cached;
+
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IHistoricalRepository>();
+
+            var signals = await repo.GetSignalsForEventAsync(eventId, marketKey);
+
+            if (signals.Count > 0)
+                await cacheService.SetAsync(cacheKey, signals, TimeSpan.FromMinutes(15));
+
+            return signals;
+        }
+
+        private async Task SaveSignalAndInvalidateCacheAsync(SignalSnapshot signal)
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IHistoricalRepository>();
+
+            await repo.SaveSignalAsync(signal);
+
+            // Invalidate so next read gets fresh data
+            await cacheService.RemoveAsync($"signals:{signal.EventId}:{signal.MarketKey}");
         }
 
         private void LogQueryDetails(OddsQueryBase query)

@@ -212,6 +212,7 @@ builder.Services.AddSingleton<IQueryParser, LocalQueryParser>();
 // 11. Orchestrator
 builder.Services.AddSingleton<IOddsOrchestrator>(sp =>
 {
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
     var localParser = sp.GetRequiredService<IQueryParser>();
     var claudeService = sp.GetRequiredService<IClaudeService>();
     var oddsService = sp.GetRequiredService<IOddsService>();
@@ -219,7 +220,7 @@ builder.Services.AddSingleton<IOddsOrchestrator>(sp =>
     var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
     var marketRepository = sp.GetRequiredService<IMarketRepository>();
     var logger = sp.GetRequiredService<ILogger<OddsOrchestrator>>();
-    return new OddsOrchestrator(localParser, claudeService, oddsService, chartService, cacheService, marketRepository, logger);
+    return new OddsOrchestrator(scopeFactory, localParser, claudeService, oddsService, chartService, cacheService, marketRepository, logger);
 });
 
 // 12. Alert and tracking services
