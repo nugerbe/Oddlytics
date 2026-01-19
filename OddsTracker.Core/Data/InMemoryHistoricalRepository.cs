@@ -10,7 +10,7 @@ namespace OddsTracker.Core.Data
     {
         private readonly List<SignalSnapshot> _signals = [];
         private long _nextId = 1;
-        private readonly object _lock = new();
+        private readonly Lock _lock = new();
 
         public Task SaveSignalAsync(SignalSnapshot signal)
         {
@@ -35,12 +35,13 @@ namespace OddsTracker.Core.Data
             return Task.CompletedTask;
         }
 
-        public Task<List<SignalSnapshot>> GetSignalsForEventAsync(string eventId, MarketType marketType)
+        public Task<List<SignalSnapshot>> GetSignalsForEventAsync(string eventId, string marketKey)
         {
             lock (_lock)
             {
                 var result = _signals
-                    .Where(s => s.EventId == eventId && s.MarketType == marketType)
+                    .Where(s => s.EventId == eventId &&
+                                s.MarketKey.Equals(marketKey, StringComparison.OrdinalIgnoreCase))
                     .ToList();
                 return Task.FromResult(result);
             }
@@ -52,6 +53,7 @@ namespace OddsTracker.Core.Data
             {
                 var result = _signals
                     .Where(s => s.SignalTime >= from && s.SignalTime <= to)
+                    .OrderByDescending(s => s.SignalTime)
                     .ToList();
                 return Task.FromResult(result);
             }
@@ -63,6 +65,7 @@ namespace OddsTracker.Core.Data
             {
                 var result = _signals
                     .Where(s => s.Outcome is null && s.GameTime < gameTimeBefore)
+                    .OrderBy(s => s.GameTime)
                     .ToList();
                 return Task.FromResult(result);
             }

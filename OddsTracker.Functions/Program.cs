@@ -1,105 +1,133 @@
 using Azure.Identity;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using OddsTracker.Core.Clients;
+using OddsTracker.Core.Data;
 using OddsTracker.Core.Interfaces;
+using OddsTracker.Core.Models;
 using OddsTracker.Core.Services;
 
 var host = new HostBuilder()
     .ConfigureFunctionsWorkerDefaults()
     .ConfigureAppConfiguration((context, config) =>
     {
-        var env = context.HostingEnvironment;
+        config
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+            .AddJsonFile($"appsettings.{context.HostingEnvironment.EnvironmentName}.json", optional: true)
+            .AddEnvironmentVariables();
 
-        // Load shared appsettings from main OddsTracker project
-        var basePath = Path.GetFullPath(Path.Combine(env.ContentRootPath, "..", "OddsTracker"));
-        if (Directory.Exists(basePath))
-        {
-            config.SetBasePath(basePath);
-            config.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
-            config.AddJsonFile($"appsettings.{env.EnvironmentName}.json", optional: true, reloadOnChange: true);
-        }
-
-        // Also check current directory (for deployed scenarios)
-        config.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
-
-        // Environment variables override file settings
-        config.AddEnvironmentVariables();
-
-        // Add Key Vault configuration for Azure deployment
+        // Azure Key Vault
         var builtConfig = config.Build();
         var keyVaultUrl = builtConfig["Azure:KeyVaultUrl"];
         if (!string.IsNullOrEmpty(keyVaultUrl))
-            config.AddAzureKeyVault(new Uri(keyVaultUrl), new DefaultAzureCredential());
+        {
+            var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
+            {
+                ExcludeEnvironmentCredential = true,
+                ExcludeWorkloadIdentityCredential = true,
+                TenantId = builtConfig["Azure:TenantId"]
+            });
+
+            config.AddAzureKeyVault(new Uri(keyVaultUrl), credential);
+        }
     })
     .ConfigureServices((context, services) =>
     {
         var configuration = context.Configuration;
 
-        // Application Insights
         services.AddApplicationInsightsTelemetryWorkerService();
         services.ConfigureFunctionsApplicationInsights();
 
         // Redis Cache
         if (configuration.GetValue<bool>("Cache:Enabled"))
         {
-            bool useExternalCache = configuration.GetValue<bool>("Cache:UseExternalCache");
-            if (!useExternalCache) services.AddHostedService<RedisDockerHostedService>();
-
             services.AddStackExchangeRedisCache(options =>
             {
-                options.Configuration = useExternalCache ? configuration["AppSettings:RedisConnection"] : "localhost:6379";
+                options.Configuration = configuration["AppSettings:RedisConnection"] ?? "localhost:6379";
                 options.InstanceName = "OddsTracker:";
             });
         }
 
-
-        // Cache Service
-        services.AddSingleton<IEnhancedCacheService, EnhancedCacheService>();
-
-        // HTTP Client for Odds API
-        services.AddHttpClient("OddsApi", client =>
+        // EF Core - Azure SQL
+        var connectionString = configuration.GetConnectionString("DefaultConnection");
+        if (!string.IsNullOrEmpty(connectionString))
         {
-            client.BaseAddress = new Uri("https://api.the-odds-api.com/v4/");
+            services.AddDbContextPool<OddsTrackerDbContext>(options =>
+            {
+                options.UseSqlServer(connectionString, sqlOptions =>
+                {
+                    sqlOptions.EnableRetryOnFailure(
+                        maxRetryCount: 5,
+                        maxRetryDelay: TimeSpan.FromSeconds(30),
+                        errorNumbersToAdd: null);
+                    sqlOptions.CommandTimeout(30);
+                });
+
+                if (context.HostingEnvironment.IsProduction())
+                {
+                    var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
+                    {
+                        ExcludeEnvironmentCredential = true,
+                        ExcludeWorkloadIdentityCredential = true,
+                        TenantId = configuration["Azure:TenantId"]
+                    });
+                    options.AddInterceptors(new AzureSqlAuthInterceptor(credential));
+                }
+            });
+
+            services.AddScoped<IHistoricalRepository, HistoricalRepository>();
+            services.AddScoped<IMarketRepository, MarketRepository>();
+        }
+        else
+        {
+            services.AddSingleton<IHistoricalRepository, InMemoryHistoricalRepository>();
+        }
+
+        // Cache services
+        services.AddSingleton<EnhancedCacheService>();
+        services.AddSingleton<ICacheService>(sp => sp.GetRequiredService<EnhancedCacheService>());
+        services.AddSingleton<IEnhancedCacheService>(sp => sp.GetRequiredService<EnhancedCacheService>());
+
+        services.AddSingleton<IMarketRepository, MarketRepository>();
+
+        // The Odds API Client - now requires ILookupService and IMarketAccessService
+        services.AddHttpClient<IOddsApiClient, OddsApiClient>((sp, client) =>
+        {
             client.DefaultRequestHeaders.Add("Accept", "application/json");
-            client.Timeout = TimeSpan.FromSeconds(30);
-        });
-
-        // The Odds API Client
-        services.AddSingleton<IOddsApiClient>(sp =>
+        }).AddTypedClient<IOddsApiClient>((httpClient, sp) =>
         {
-            var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
-            var httpClient = httpClientFactory.CreateClient("OddsApi");
-            var apiKey = configuration["AppSettings:TheOddsApiKey"] ?? throw new InvalidOperationException("AppSettings:TheOddsApiKey not configured");
+            var apiKey = configuration["AppSettings:TheOddsApiKey"]
+                ?? throw new InvalidOperationException("TheOddsApiKey not configured");
+            var logger = sp.GetRequiredService<ILogger<OddsApiClient>>();
 
-            return new OddsApiClient(httpClient, apiKey);
+            return new OddsApiClient(httpClient, apiKey, logger);
         });
 
-        // Platform Services
+        // Configure options
+        services.Configure<CacheOptions>(configuration.GetSection("Cache"));
+        services.Configure<AlertEngineOptions>(configuration.GetSection("AlertEngine"));
+        services.Configure<ConfidenceScoringOptions>(configuration.GetSection("ConfidenceScoring"));
+        services.Configure<HistoricalTrackerOptions>(configuration.GetSection("HistoricalTracker"));
+
+        // Core services
+        services.AddMemoryCache();
+        services.AddSingleton<ISportsDataService, SportsDataService>();
         services.AddSingleton<IMovementFingerprintService, MovementFingerprintService>();
         services.AddSingleton<IConfidenceScoringEngine, ConfidenceScoringEngine>();
         services.AddSingleton<IAlertEngine, AlertEngine>();
         services.AddSingleton<IHistoricalTracker, HistoricalTracker>();
-
-        // Discord Webhook Alert Service
-        services.AddHttpClient("Discord", client =>
-        {
-            client.Timeout = TimeSpan.FromSeconds(10);
-        });
         services.AddSingleton<IDiscordAlertService, WebhookDiscordAlertService>();
-    })
-    .ConfigureLogging((context, logging) =>
-    {
-        logging.AddConsole();
 
-        // Set log levels
-        logging.SetMinimumLevel(LogLevel.Information);
-        logging.AddFilter("Microsoft", LogLevel.Warning);
-        logging.AddFilter("System", LogLevel.Warning);
-        logging.AddFilter("OddsTracker", LogLevel.Debug);
+        // Logging
+        services.AddLogging(logging =>
+        {
+            logging.AddConsole();
+            logging.SetMinimumLevel(LogLevel.Information);
+        });
     })
     .Build();
 

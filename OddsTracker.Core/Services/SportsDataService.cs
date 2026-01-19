@@ -65,6 +65,12 @@ namespace OddsTracker.Core.Services
             }
         }
 
+        public async Task<List<Score>> GetSeasonScores()
+        {
+            var currentSeason = await _scoresClient.GetSeasonCurrentAsync();
+            return await _scoresClient.GetGamesBySeasonLiveFinalAsync(currentSeason.ToString());
+        }
+
         public async Task<PlayerTeamInfo?> GetPlayerTeamAsync(string playerName)
         {
             if (string.IsNullOrWhiteSpace(playerName))

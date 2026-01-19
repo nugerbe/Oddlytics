@@ -1,4 +1,5 @@
-﻿using OddsTracker.Core.Models;
+﻿using FantasyData.Api.Client.Model.NFLv3;
+using OddsTracker.Core.Models;
 
 namespace OddsTracker.Core.Interfaces
 {
@@ -12,5 +13,6 @@ namespace OddsTracker.Core.Interfaces
         /// Returns the team full name (e.g., "Buffalo Bills") or null if not found.
         /// </summary>
         Task<PlayerTeamInfo?> GetPlayerTeamAsync(string playerName);
+        Task<List<Score>> GetSeasonScores();
     }
 }

@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Logging;
 using OddsTracker.Core.Models;
 using OddsTracker.Core.Interfaces;
+using static OddsTracker.Core.Models.Entities;
 
 namespace OddsTracker.Core.Data
 {
@@ -17,7 +18,8 @@ namespace OddsTracker.Core.Data
             await db.SaveChangesAsync();
 
             signal.Id = entity.Id;
-            logger.LogDebug("Saved signal snapshot {Id} for event {EventId}", entity.Id, signal.EventId);
+            logger.LogDebug("Saved signal snapshot {Id} for event {EventId} market {MarketKey}",
+                entity.Id, signal.EventId, signal.MarketKey);
         }
 
         public async Task UpdateSignalAsync(SignalSnapshot signal)
@@ -37,11 +39,12 @@ namespace OddsTracker.Core.Data
             logger.LogDebug("Updated signal snapshot {Id} with outcome {Outcome}", signal.Id, signal.Outcome);
         }
 
-        public async Task<List<SignalSnapshot>> GetSignalsForEventAsync(string eventId, MarketType marketType)
+        public async Task<List<SignalSnapshot>> GetSignalsForEventAsync(string eventId, string marketKey)
         {
             var entities = await db.SignalSnapshots
                 .AsNoTracking()
-                .Where(s => s.EventId == eventId && s.MarketType == marketType)
+                .Where(s => s.EventId == eventId &&
+                            s.MarketKey.Equals(marketKey, StringComparison.OrdinalIgnoreCase))
                 .ToListAsync();
 
             return [.. entities.Select(e => e.ToModel())];

@@ -1,6 +1,6 @@
 ﻿using Microsoft.Extensions.Logging;
-using OddsTracker.Core.Models;
 using OddsTracker.Core.Interfaces;
+using OddsTracker.Core.Models;
 using System.Text.RegularExpressions;
 
 namespace OddsTracker.Core.Services
@@ -10,30 +10,48 @@ namespace OddsTracker.Core.Services
     /// Uses ISportsDataService for team aliases.
     /// Falls back to Claude for complex/ambiguous queries.
     /// </summary>
-    public partial class LocalQueryParser : IQueryParser
+    public partial class LocalQueryParser(IMarketRepository marketRepository, ISportsDataService sportsDataService, ILogger<LocalQueryParser> logger) : IQueryParser
     {
-        private readonly ISportsDataService _sportsDataService;
-        private readonly ILogger<LocalQueryParser> _logger;
+        private readonly IMarketRepository _marketRepository = marketRepository;
+        private readonly ISportsDataService _sportsDataService = sportsDataService;
+        private readonly ILogger<LocalQueryParser> _logger = logger;
 
-        private static readonly string[] SpreadKeywords = ["spread", "line", "point spread", "points", "ats", "against the spread"];
-        private static readonly string[] MoneylineKeywords = ["moneyline", "money line", "ml", "to win", "outright"];
-        private static readonly string[] TotalKeywords = ["total", "over", "under", "o/u", "over/under", "points total"];
-
-        public LocalQueryParser(ISportsDataService sportsDataService, ILogger<LocalQueryParser> logger)
-        {
-            _sportsDataService = sportsDataService;
-            _logger = logger;
-        }
-
-        public async Task<OddsQuery?> TryParseAsync(string userMessage)
+        public async Task<OddsQueryBase?> TryParseAsync(string userMessage)
         {
             if (string.IsNullOrWhiteSpace(userMessage))
                 return null;
 
             var input = userMessage.ToLowerInvariant().Trim();
-            var teamAliases = await _sportsDataService.GetTeamAliasesAsync();
 
-            // Extract teams
+            // 1. Extract sport (default to NFL)
+            var sport = await _marketRepository.GetSportByKeywordAsync(input) ?? throw new Exception("Could not parse sport");
+            // 2. Extract market (scoped to sport, default to spreads)
+            var market = await _marketRepository.GetMarketByKeywordAsync(input, sport.Key) ?? throw new Exception("Could not parse market");
+            var daysBack = ExtractDaysBack(input);
+
+            _logger.LogDebug("Parsed: Sport={Sport}, Market={Market}, Days={Days}", sport.Key, market.Key, daysBack);
+
+            // Check if this is a player prop query
+            if (market.IsPlayerProp)
+            {
+                var playerName = ExtractPlayerName(input) ?? throw new Exception("Could not parse player name");
+                var playerInfo = await _sportsDataService.GetPlayerTeamAsync(playerName);
+
+                _logger.LogDebug("Parsed player prop locally: Player={Player}, Market={Market}, Days={Days}",
+                        playerName, market.DisplayName, daysBack);
+
+                return new PlayerOddsQuery
+                {
+                    MarketDefinition = market,
+                    Sport = sport.Key,
+                    DaysBack = daysBack,
+                    PlayerName = playerInfo?.PlayerName ?? playerName,
+                    Team = playerInfo?.TeamFullName
+                };
+            }
+
+            // Game odds query
+            var teamAliases = await _sportsDataService.GetTeamAliasesAsync();
             var (homeTeam, awayTeam) = ExtractTeams(input, teamAliases);
             if (homeTeam is null)
             {
@@ -41,27 +59,28 @@ namespace OddsTracker.Core.Services
                 return null;
             }
 
-            // Extract market type
-            var marketType = ExtractMarketType(input);
-
-            // Extract days back
-            var daysBack = ExtractDaysBack(input);
-
-            _logger.LogDebug("Parsed locally: Home={Home}, Away={Away}, Market={Market}, Days={Days}",
-                homeTeam, awayTeam ?? "none", marketType, daysBack);
-
-            return new OddsQuery
+            return new GameOddsQuery
             {
+                MarketDefinition = market,
+                Sport = sport.Key,
                 HomeTeam = homeTeam,
                 AwayTeam = awayTeam,
-                MarketType = marketType,
                 DaysBack = daysBack
             };
         }
 
+        private static string? ExtractPlayerName(string input)
+        {
+            var playerMatch = PlayerNamePattern().Match(input);
+            if (playerMatch.Success)
+            {
+                return playerMatch.Groups[1].Value.Trim();
+            }
+            return null;
+        }
+
         private static (string? homeTeam, string? awayTeam) ExtractTeams(string input, Dictionary<string, string> teamAliases)
         {
-            // Pattern: "team1 at/vs/@ team2" or "team1 versus team2"
             var vsMatch = VsPattern().Match(input);
             if (vsMatch.Success)
             {
@@ -70,15 +89,12 @@ namespace OddsTracker.Core.Services
 
                 if (team1 is not null && team2 is not null)
                 {
-                    // "away at home" or "away vs home" - first team is typically away
                     return (team2, team1); // home, away
                 }
             }
 
-            // Single team pattern - find any team mention
             foreach (var (alias, fullName) in teamAliases)
             {
-                // Check for whole word match to avoid partial matches
                 if (Regex.IsMatch(input, $@"\b{Regex.Escape(alias)}\b", RegexOptions.IgnoreCase))
                 {
                     return (fullName, null);
@@ -90,11 +106,9 @@ namespace OddsTracker.Core.Services
 
         private static string? ResolveTeam(string input, Dictionary<string, string> teamAliases)
         {
-            // Direct alias match
             if (teamAliases.TryGetValue(input, out var team))
                 return team;
 
-            // Check if input contains any alias (whole word)
             foreach (var (alias, fullName) in teamAliases)
             {
                 if (Regex.IsMatch(input, $@"\b{Regex.Escape(alias)}\b", RegexOptions.IgnoreCase))
@@ -102,30 +116,6 @@ namespace OddsTracker.Core.Services
             }
 
             return null;
-        }
-
-        private static MarketType ExtractMarketType(string input)
-        {
-            foreach (var keyword in TotalKeywords)
-            {
-                if (input.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-                    return MarketType.Total;
-            }
-
-            foreach (var keyword in MoneylineKeywords)
-            {
-                if (input.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-                    return MarketType.Moneyline;
-            }
-
-            foreach (var keyword in SpreadKeywords)
-            {
-                if (input.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-                    return MarketType.Spread;
-            }
-
-            // Default to spread (most common)
-            return MarketType.Spread;
         }
 
         private static int ExtractDaysBack(string input)
@@ -154,5 +144,8 @@ namespace OddsTracker.Core.Services
 
         [GeneratedRegex(@"(?:last|past)\s+(\d+)\s*days?", RegexOptions.IgnoreCase)]
         private static partial Regex DaysPattern();
+
+        [GeneratedRegex(@"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:passing|rushing|receiving|yards|tds|receptions)", RegexOptions.IgnoreCase)]
+        private static partial Regex PlayerNamePattern();
     }
 }

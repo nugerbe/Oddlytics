@@ -1,5 +1,4 @@
 ﻿using Newtonsoft.Json;
-using System.Text.Json.Serialization;
 
 namespace OddsTracker.Core.Models
 {
@@ -14,7 +13,7 @@ namespace OddsTracker.Core.Models
         bool Success,
         List<ChartResult>? Charts,
         string? ErrorMessage,
-        OddsQuery? ParsedQuery,
+        OddsQueryBase? ParsedQuery,
         string? GameDescription
     );
 
@@ -22,14 +21,17 @@ namespace OddsTracker.Core.Models
     /// Represents a unique market (game + market type combination)
     /// </summary>
     public record MarketKey(
-        string EventId,
-        string HomeTeam,
-        string AwayTeam,
-        MarketType MarketType,
-        DateTime CommenceTime
-    )
+    string EventId,
+    string HomeTeam,
+    string AwayTeam,
+    MarketDefinition MarketType,
+    DateTime CommenceTime
+)
     {
-        public string Key => $"{EventId}:{MarketType}";
+        /// <summary>
+        /// Unique key for caching: eventId:marketKey
+        /// </summary>
+        public string Key => $"{EventId}:{MarketType.Key}";
     }
 
     /// <summary>
@@ -67,7 +69,7 @@ namespace OddsTracker.Core.Models
         public TimeSpan? RetailLag { get; set; }
 
         // Book breakdown
-        public List<BookSnapshot> BookSnapshots { get; set; } = new();
+        public List<BookSnapshotBase> BookSnapshots { get; set; } = [];
 
         // Confirmation count
         public int ConfirmingBooks => BookSnapshots.Count(b =>
@@ -85,27 +87,10 @@ namespace OddsTracker.Core.Models
         public bool HasMaterialChange(MarketFingerprint? previous)
         {
             if (previous == null) return true;
-
-            // Material change = line moved 0.5+ points OR new first mover
             return DeltaMagnitude >= 0.5m
                 || FirstMoverBook != previous.FirstMoverBook
                 || ContentHash != previous.ContentHash;
         }
-    }
-
-    public class BookSnapshot
-    {
-        public string BookmakerName { get; set; } = string.Empty;
-        public string BookmakerKey { get; set; } = string.Empty;
-        public BookmakerTier BookType { get; set; }
-        public decimal Line { get; set; }
-        public decimal? HomeOdds { get; set; }  // For game lines: home team odds / For props: Over odds
-        public decimal? AwayOdds { get; set; }  // For game lines: away team odds / For props: Under odds
-        public DateTime Timestamp { get; set; }
-
-        // For player props
-        public string? PlayerName { get; set; }
-        public string? OutcomeName { get; set; }  // "Over" or "Under" for props
     }
 
     /// <summary>
@@ -171,7 +156,7 @@ namespace OddsTracker.Core.Models
     {
         public long Id { get; set; }
         public string EventId { get; set; } = string.Empty;
-        public MarketType MarketType { get; set; }
+        public string MarketKey { get; set; } = string.Empty;
         public DateTime SignalTime { get; set; }
         public DateTime GameTime { get; set; }
 
@@ -292,39 +277,39 @@ namespace OddsTracker.Core.Models
         }
     }
 
-        /// <summary>
-        /// A snapshot of odds at a specific point in time
-        /// </summary>
-        public record OddsSnapshot(
-        DateTime Timestamp,
-        OddsEvent Event
-    );
+    /// <summary>
+    /// A snapshot of odds at a specific point in time
+    /// </summary>
+    public record OddsSnapshot(
+    DateTime Timestamp,
+    OddsEvent Event
+);
 
     /// <summary>
     /// An event (game) with odds from multiple bookmakers
     /// </summary>
     public record OddsEvent
     {
-        [JsonPropertyName("id")]
+        [JsonProperty("id")]
         public string Id { get; init; } = "";
 
-        [JsonPropertyName("sport_key")]
+        [JsonProperty("sport_key")]
         public string SportKey { get; init; } = "";
 
-        [JsonPropertyName("sport_title")]
+        [JsonProperty("sport_title")]
         public string SportTitle { get; init; } = "";
 
-        [JsonPropertyName("commence_time")]
+        [JsonProperty("commence_time")]
         public DateTime CommenceTime { get; init; }
 
-        [JsonPropertyName("home_team")]
+        [JsonProperty("home_team")]
         public string HomeTeam { get; init; } = "";
 
-        [JsonPropertyName("away_team")]
+        [JsonProperty("away_team")]
         public string AwayTeam { get; init; } = "";
 
-        [JsonPropertyName("bookmakers")]
-        public List<Bookmaker> Bookmakers { get; init; } = new();
+        [JsonProperty("bookmakers")]
+        public List<Bookmaker> Bookmakers { get; init; } = [];
     }
 
     /// <summary>
@@ -332,17 +317,17 @@ namespace OddsTracker.Core.Models
     /// </summary>
     public record Bookmaker
     {
-        [JsonPropertyName("key")]
+        [JsonProperty("key")]
         public string Key { get; init; } = "";
 
-        [JsonPropertyName("title")]
+        [JsonProperty("title")]
         public string Title { get; init; } = "";
 
-        [JsonPropertyName("last_update")]
+        [JsonProperty("last_update")]
         public DateTime LastUpdate { get; init; }
 
-        [JsonPropertyName("markets")]
-        public List<Market> Markets { get; init; } = new();
+        [JsonProperty("markets")]
+        public List<Market> Markets { get; init; } = [];
     }
 
     /// <summary>
@@ -350,14 +335,14 @@ namespace OddsTracker.Core.Models
     /// </summary>
     public record Market
     {
-        [JsonPropertyName("key")]
+        [JsonProperty("key")]
         public string Key { get; init; } = "";
 
-        [JsonPropertyName("last_update")]
+        [JsonProperty("last_update")]
         public DateTime? LastUpdate { get; init; }
 
-        [JsonPropertyName("outcomes")]
-        public List<Outcome> Outcomes { get; init; } = new();
+        [JsonProperty("outcomes")]
+        public List<Outcome> Outcomes { get; init; } = [];
     }
 
     /// <summary>
@@ -365,10 +350,10 @@ namespace OddsTracker.Core.Models
     /// </summary>
     public record Outcome
     {
-        [JsonPropertyName("name")]
+        [JsonProperty("name")]
         public string Name { get; init; } = "";
 
-        [JsonPropertyName("price")]
+        [JsonProperty("price")]
         public int Price { get; init; }
 
         /// <summary>
@@ -376,13 +361,13 @@ namespace OddsTracker.Core.Models
         /// For totals: the total points line (e.g., 47.5)
         /// For player props: the line (e.g., 21.5 pass completions)
         /// </summary>
-        [JsonPropertyName("point")]
+        [JsonProperty("point")]
         public decimal? Point { get; init; }
 
         /// <summary>
         /// For player props: the player name (e.g., "Josh Allen")
         /// </summary>
-        [JsonPropertyName("description")]
+        [JsonProperty("description")]
         public string? Description { get; init; }
     }
 
@@ -391,22 +376,22 @@ namespace OddsTracker.Core.Models
     /// </summary>
     public record SportEvent
     {
-        [JsonPropertyName("id")]
+        [JsonProperty("id")]
         public string Id { get; init; } = "";
 
-        [JsonPropertyName("sport_key")]
+        [JsonProperty("sport_key")]
         public string SportKey { get; init; } = "";
 
-        [JsonPropertyName("sport_title")]
+        [JsonProperty("sport_title")]
         public string SportTitle { get; init; } = "";
 
-        [JsonPropertyName("commence_time")]
+        [JsonProperty("commence_time")]
         public DateTime CommenceTime { get; init; }
 
-        [JsonPropertyName("home_team")]
+        [JsonProperty("home_team")]
         public string HomeTeam { get; init; } = "";
 
-        [JsonPropertyName("away_team")]
+        [JsonProperty("away_team")]
         public string AwayTeam { get; init; } = "";
     }
 
@@ -415,40 +400,40 @@ namespace OddsTracker.Core.Models
     /// </summary>
     public record ScoreEvent
     {
-        [JsonPropertyName("id")]
+        [JsonProperty("id")]
         public string Id { get; init; } = "";
 
-        [JsonPropertyName("sport_key")]
+        [JsonProperty("sport_key")]
         public string SportKey { get; init; } = "";
 
-        [JsonPropertyName("sport_title")]
+        [JsonProperty("sport_title")]
         public string SportTitle { get; init; } = "";
 
-        [JsonPropertyName("commence_time")]
+        [JsonProperty("commence_time")]
         public DateTime CommenceTime { get; init; }
 
-        [JsonPropertyName("completed")]
+        [JsonProperty("completed")]
         public bool Completed { get; init; }
 
-        [JsonPropertyName("home_team")]
+        [JsonProperty("home_team")]
         public string HomeTeam { get; init; } = "";
 
-        [JsonPropertyName("away_team")]
+        [JsonProperty("away_team")]
         public string AwayTeam { get; init; } = "";
 
-        [JsonPropertyName("scores")]
+        [JsonProperty("scores")]
         public List<TeamScore>? Scores { get; init; }
 
-        [JsonPropertyName("last_update")]
+        [JsonProperty("last_update")]
         public DateTime? LastUpdate { get; init; }
     }
 
     public record TeamScore
     {
-        [JsonPropertyName("name")]
+        [JsonProperty("name")]
         public string Name { get; init; } = "";
 
-        [JsonPropertyName("score")]
+        [JsonProperty("score")]
         public string Score { get; init; } = "";
     }
 
@@ -457,17 +442,17 @@ namespace OddsTracker.Core.Models
     /// </summary>
     public record HistoricalOddsResponse
     {
-        [JsonPropertyName("timestamp")]
+        [JsonProperty("timestamp")]
         public DateTime Timestamp { get; init; }
 
-        [JsonPropertyName("previous_timestamp")]
+        [JsonProperty("previous_timestamp")]
         public DateTime? PreviousTimestamp { get; init; }
 
-        [JsonPropertyName("next_timestamp")]
+        [JsonProperty("next_timestamp")]
         public DateTime? NextTimestamp { get; init; }
 
-        [JsonPropertyName("data")]
-        public List<OddsEvent> Data { get; init; } = new();
+        [JsonProperty("data")]
+        public List<OddsEvent> Data { get; init; } = [];
     }
 
     /// <summary>
@@ -475,16 +460,16 @@ namespace OddsTracker.Core.Models
     /// </summary>
     public record HistoricalEventOddsResponse
     {
-        [JsonPropertyName("timestamp")]
+        [JsonProperty("timestamp")]
         public DateTime Timestamp { get; init; }
 
-        [JsonPropertyName("previous_timestamp")]
+        [JsonProperty("previous_timestamp")]
         public DateTime? PreviousTimestamp { get; init; }
 
-        [JsonPropertyName("next_timestamp")]
+        [JsonProperty("next_timestamp")]
         public DateTime? NextTimestamp { get; init; }
 
-        [JsonPropertyName("data")]
+        [JsonProperty("data")]
         public OddsEvent? Data { get; init; }
     }
 
@@ -501,40 +486,40 @@ namespace OddsTracker.Core.Models
 
     public class WebhookPayload
     {
-        [JsonPropertyName("username")]
+        [JsonProperty("username")]
         public string? Username { get; set; }
 
-        [JsonPropertyName("embeds")]
+        [JsonProperty("embeds")]
         public List<WebhookEmbed> Embeds { get; set; } = [];
     }
 
     public class WebhookEmbed
     {
-        [JsonPropertyName("title")]
+        [JsonProperty("title")]
         public string? Title { get; set; }
 
-        [JsonPropertyName("description")]
+        [JsonProperty("description")]
         public string? Description { get; set; }
 
-        [JsonPropertyName("color")]
+        [JsonProperty("color")]
         public int Color { get; set; }
 
-        [JsonPropertyName("fields")]
+        [JsonProperty("fields")]
         public List<WebhookField> Fields { get; set; } = [];
 
-        [JsonPropertyName("timestamp")]
+        [JsonProperty("timestamp")]
         public string? Timestamp { get; set; }
     }
 
     public class WebhookField
     {
-        [JsonPropertyName("name")]
+        [JsonProperty("name")]
         public string Name { get; set; } = string.Empty;
 
-        [JsonPropertyName("value")]
+        [JsonProperty("value")]
         public string Value { get; set; } = string.Empty;
 
-        [JsonPropertyName("inline")]
+        [JsonProperty("inline")]
         public bool Inline { get; set; }
     }
 
@@ -606,5 +591,94 @@ namespace OddsTracker.Core.Models
 
         [JsonProperty("last_update")]
         public DateTime LastUpdate { get; init; }
+    }
+
+    /// <summary>
+    /// Sport domain model
+    /// </summary>
+    public class Sport
+    {
+        public int Id { get; init; }
+        public required string Key { get; init; }
+        public required string DisplayName { get; init; }
+        public SportCategory Category { get; init; }
+        public GamePeriodType PeriodType { get; init; }
+        public bool IsActive { get; init; } = true;
+        public IReadOnlyList<MarketDefinition> AvailableMarkets { get; init; } = [];
+
+        /// <summary>
+        /// Parsed keywords for search matching
+        /// </summary>
+        public IReadOnlyList<string> Keywords { get; init; } = [];
+
+        public IEnumerable<string> MarketKeys => AvailableMarkets.Select(m => m.Key);
+
+        public bool SupportsMarket(string marketKey) =>
+            AvailableMarkets.Any(m => m.Key.Equals(marketKey, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>
+        /// Check if input contains or equals any keyword
+        /// </summary>
+        public bool MatchesKeyword(string input) =>
+            Keywords.Any(k =>
+                input.Equals(k, StringComparison.OrdinalIgnoreCase) ||
+                input.Contains(k, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Market definition domain model
+    /// </summary>
+    public class MarketDefinition
+    {
+        public int Id { get; init; }
+        public required string Key { get; init; }
+        public required string DisplayName { get; init; }
+        public MarketCategory Category { get; init; }
+        public OutcomeType OutcomeType { get; init; }
+        public SubscriptionTier RequiredTier { get; init; }
+        public bool IsPlayerProp { get; init; }
+        public bool IsAlternate { get; init; }
+        public GamePeriod? Period { get; init; }
+        public string? Description { get; init; }
+
+        /// <summary>
+        /// Parsed keywords for search matching
+        /// </summary>
+        public IReadOnlyList<string> Keywords { get; init; } = [];
+
+        /// <summary>
+        /// Check if input contains or equals any keyword
+        /// </summary>
+        public bool MatchesKeyword(string input) =>
+            Keywords.Any(k =>
+                input.Equals(k, StringComparison.OrdinalIgnoreCase) ||
+                input.Contains(k, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Bookmaker domain model
+    /// </summary>
+    public class BookmakerInfo
+    {
+        public int Id { get; init; }
+        public required string Key { get; init; }
+        public required string DisplayName { get; init; }
+        public SubscriptionTier RequiredTier { get; init; }
+        public BookmakerTier Tier { get; init; }
+        public string Region { get; init; } = "us";
+        public bool IsActive { get; init; } = true;
+
+        /// <summary>
+        /// Parsed keywords for search matching
+        /// </summary>
+        public IReadOnlyList<string> Keywords { get; init; } = [];
+
+        /// <summary>
+        /// Check if input contains or equals any keyword
+        /// </summary>
+        public bool MatchesKeyword(string input) =>
+            Keywords.Any(k =>
+                input.Equals(k, StringComparison.OrdinalIgnoreCase) ||
+                input.Contains(k, StringComparison.OrdinalIgnoreCase));
     }
 }

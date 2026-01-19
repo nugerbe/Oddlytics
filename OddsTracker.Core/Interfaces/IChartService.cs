@@ -4,6 +4,6 @@ namespace OddsTracker.Core.Interfaces
 {
     public interface IChartService
     {
-        Task<byte[]> GenerateChartAsync(List<NormalizedOdds> odds, OddsQuery query, TeamSide side = TeamSide.Home);
+        Task<byte[]> GenerateChartAsync(List<OddsBase> odds, OddsQueryBase query, TeamSide side = TeamSide.Home);
     }
 }

@@ -7,39 +7,35 @@ using System.Text.Json;
 
 namespace OddsTracker.Core.Services
 {
-    public class MovementFingerprintService(ICacheService cache, ILogger<MovementFingerprintService> logger) : IMovementFingerprintService
+    public class MovementFingerprintService(
+        IEnhancedCacheService cache,
+        IMarketRepository marketRepository,
+        ILogger<MovementFingerprintService> logger) : IMovementFingerprintService
     {
-        private readonly ICacheService _cache = cache;
-        private readonly ILogger<MovementFingerprintService> _logger = logger;
-
-        // Book classification
-        private static readonly Dictionary<string, BookmakerTier> BookClassification = new(StringComparer.OrdinalIgnoreCase)
+        public async Task<MarketFingerprint> CreateFingerprintAsync(OddsBase odds, MarketFingerprint? previous)
         {
-            // Sharp books - fast, accurate, respected
-            ["lowvig"] = BookmakerTier.Sharp,
-            ["betonlineag"] = BookmakerTier.Sharp,
+            var market = odds.MarketDefinition;
 
-            // Market makers - high volume, influential
-            ["betmgm"] = BookmakerTier.Market,
-            ["williamhill_us"] = BookmakerTier.Market,
-            ["bet365"] = BookmakerTier.Market,
-
-            // Retail - slower to move, follow sharps
-            ["fanatics"] = BookmakerTier.Retail,
-            ["betus"] = BookmakerTier.Retail,
-            ["mybookieag"] = BookmakerTier.Retail,
-            ["bovada"] = BookmakerTier.Retail,
-            ["draftkings"] = BookmakerTier.Retail,
-            ["fanduel"] = BookmakerTier.Retail,
-        };
-
-        public async Task<MarketFingerprint> CreateFingerprintAsync(NormalizedOdds odds, MarketFingerprint? previous)
-        {
             // Classify each book
-            foreach (var snapshot in odds.Snapshots)
+            await ClassifyBooksAsync(odds.Snapshots);
+
+            // Build market key based on odds type
+            var marketKey = odds switch
             {
-                snapshot.BookType = ClassifyBook(snapshot.BookmakerKey ?? snapshot.BookmakerName);
-            }
+                GameOdds game => new MarketKey(
+                    odds.EventId,
+                    game.HomeTeam,
+                    game.AwayTeam,
+                    market,
+                    odds.CommenceTime),
+                PlayerOdds player => new MarketKey(
+                    odds.EventId,
+                    player.Team,
+                    player.Opponent ?? string.Empty,
+                    market,
+                    odds.CommenceTime),
+                _ => throw new ArgumentException($"Unknown odds type: {odds.GetType().Name}")
+            };
 
             // Calculate consensus line (median across all books)
             var lines = odds.Snapshots.Select(s => s.Line).OrderBy(l => l).ToList();
@@ -49,12 +45,7 @@ namespace OddsTracker.Core.Services
 
             var fingerprint = new MarketFingerprint
             {
-                Market = new MarketKey(
-                    odds.EventId,
-                    odds.HomeTeam,
-                    odds.AwayTeam,
-                    odds.MarketType,
-                    odds.CommenceTime),
+                Market = marketKey,
                 Timestamp = DateTime.UtcNow,
                 ConsensusLine = consensusLine,
                 PreviousConsensusLine = previous?.ConsensusLine ?? consensusLine,
@@ -81,175 +72,170 @@ namespace OddsTracker.Core.Services
 
         public async Task<MarketFingerprint> CreateFingerprintAsync(
             string eventId,
-            MarketType marketType,
-            List<BookSnapshot> snapshots)
+            MarketDefinition market,
+            List<BookSnapshotBase> snapshots,
+            string homeTeam = "",
+            string awayTeam = "",
+            DateTime? commenceTime = null)
         {
-            var marketKey = $"{eventId}:{marketType}";
-            var previous = await GetPreviousFingerprintAsync(marketKey);
-
             // Classify each book
-            foreach (var snapshot in snapshots)
-            {
-                snapshot.BookType = ClassifyBook(snapshot.BookmakerKey ?? snapshot.BookmakerName);
-            }
+            await ClassifyBooksAsync(snapshots);
 
-            // Calculate consensus line (median across all books)
+            // Calculate consensus line
             var lines = snapshots.Select(s => s.Line).OrderBy(l => l).ToList();
-            var consensusLine = lines.Count > 0
-                ? lines[lines.Count / 2]
-                : 0m;
+            var consensusLine = lines.Count > 0 ? lines[lines.Count / 2] : 0m;
 
             var fingerprint = new MarketFingerprint
             {
-                Market = new MarketKey(eventId, "", "", marketType, DateTime.UtcNow),
+                Market = new MarketKey(
+                    eventId,
+                    homeTeam,
+                    awayTeam,
+                    market,
+                    commenceTime ?? DateTime.UtcNow),
                 Timestamp = DateTime.UtcNow,
                 ConsensusLine = consensusLine,
-                PreviousConsensusLine = previous?.ConsensusLine ?? consensusLine,
+                PreviousConsensusLine = consensusLine,
                 BookSnapshots = snapshots
             };
 
-            // Detect first mover
-            DetectFirstMover(fingerprint, previous);
-
-            // Calculate velocity
-            CalculateVelocity(fingerprint, previous);
-
-            // Calculate retail lag
-            CalculateRetailLag(fingerprint);
-
-            // Track stability
-            TrackStability(fingerprint, previous);
-
-            // Generate content hash for change detection
             fingerprint.ContentHash = GenerateContentHash(fingerprint);
 
             return fingerprint;
         }
 
-        private static BookmakerTier ClassifyBook(string bookmakerKey)
+        public async Task<MarketFingerprint?> GetPreviousFingerprintAsync(string eventId, string marketKey)
         {
-            return BookClassification.GetValueOrDefault(
-                bookmakerKey.ToLowerInvariant(),
-                BookmakerTier.Retail);
-        }
-
-        private void DetectFirstMover(MarketFingerprint current, MarketFingerprint? previous)
-        {
-            if (previous is null || current.DeltaMagnitude < 0.5m)
-                return;
-
-            // Find book that moved first (earliest timestamp with different line)
-            var movedBooks = current.BookSnapshots
-                .Where(b =>
-                {
-                    var prevBook = previous.BookSnapshots
-                        .FirstOrDefault(pb => pb.BookmakerName == b.BookmakerName);
-                    return prevBook is not null && Math.Abs(b.Line - prevBook.Line) >= 0.5m;
-                })
-                .OrderBy(b => b.Timestamp)
-                .ToList();
-
-            if (movedBooks.Count > 0)
-            {
-                var firstMover = movedBooks[0];
-                current.FirstMoverBook = firstMover.BookmakerName;
-                current.FirstMoverType = firstMover.BookType;
-                current.FirstMoveTime = firstMover.Timestamp;
-
-                _logger.LogDebug(
-                    "First mover detected: {Book} ({Type}) at {Time}",
-                    firstMover.BookmakerName,
-                    firstMover.BookType,
-                    firstMover.Timestamp);
-            }
-        }
-
-        private static void CalculateVelocity(MarketFingerprint current, MarketFingerprint? previous)
-        {
-            if (previous is null)
-            {
-                current.Velocity = 0;
-                return;
-            }
-
-            var timeDiff = (current.Timestamp - previous.Timestamp).TotalHours;
-            if (timeDiff <= 0)
-            {
-                current.Velocity = 0;
-                return;
-            }
-
-            // Points per hour
-            current.Velocity = current.DeltaMagnitude / (decimal)timeDiff;
-        }
-
-        private static void CalculateRetailLag(MarketFingerprint fingerprint)
-        {
-            if (fingerprint.FirstMoverType != BookmakerTier.Sharp || !fingerprint.FirstMoveTime.HasValue)
-                return;
-
-            // Find when first retail book matched the move
-            var retailFollow = fingerprint.BookSnapshots
-                .Where(b => b.BookType == BookmakerTier.Retail)
-                .Where(b => Math.Abs(b.Line - fingerprint.ConsensusLine) < 0.5m)
-                .OrderBy(b => b.Timestamp)
-                .FirstOrDefault();
-
-            if (retailFollow is not null)
-            {
-                fingerprint.RetailLag = retailFollow.Timestamp - fingerprint.FirstMoveTime.Value;
-            }
-        }
-
-        private static void TrackStability(MarketFingerprint current, MarketFingerprint? previous)
-        {
-            if (previous is null)
-                return;
-
-            // Check if line reversed (moved back toward previous)
-            var prevDelta = previous.ConsensusLine - previous.PreviousConsensusLine;
-            var currDelta = current.ConsensusLine - previous.ConsensusLine;
-
-            // Signs differ = reversal
-            if (prevDelta != 0 && currDelta != 0 &&
-                Math.Sign(prevDelta) != Math.Sign(currDelta))
-            {
-                current.LastReversalTime = DateTime.UtcNow;
-            }
-            else
-            {
-                current.LastReversalTime = previous.LastReversalTime;
-            }
-        }
-
-        private static string GenerateContentHash(MarketFingerprint fingerprint)
-        {
-            var content = JsonSerializer.Serialize(new
-            {
-                fingerprint.ConsensusLine,
-                fingerprint.FirstMoverBook,
-                fingerprint.ConfirmingBooks,
-                Books = fingerprint.BookSnapshots.Select(b => new { b.BookmakerName, b.Line })
-            });
-
-            var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(content));
-            return Convert.ToBase64String(hashBytes)[..16];
-        }
-
-        public async Task<MarketFingerprint?> GetPreviousFingerprintAsync(string marketKey)
-        {
-            return await _cache.GetAsync<MarketFingerprint>($"fingerprint:{marketKey}");
+            return await cache.GetFingerprintAsync(eventId, marketKey);
         }
 
         public async Task SaveFingerprintAsync(MarketFingerprint fingerprint)
         {
-            var key = $"fingerprint:{fingerprint.Market.Key}";
-            await _cache.SetAsync(key, fingerprint, TimeSpan.FromHours(24));
+            await cache.SetFingerprintAsync(fingerprint);
+
+            logger.LogDebug(
+                "Saved fingerprint: {EventId}:{MarketKey} Consensus={Consensus}",
+                fingerprint.Market.EventId,
+                fingerprint.Market.MarketType.Key,
+                fingerprint.ConsensusLine);
         }
 
         public bool HasMaterialChange(MarketFingerprint current, MarketFingerprint? previous)
         {
             return current.HasMaterialChange(previous);
+        }
+
+        /// <summary>
+        /// Classify books using database bookmaker info when available
+        /// </summary>
+        private async Task ClassifyBooksAsync(List<BookSnapshotBase> snapshots)
+        {
+            // Try to get bookmaker info from database
+            var bookmakers = await marketRepository.GetAllBookmakersAsync();
+            var bookmakersByKey = bookmakers.ToDictionary(
+                b => b.Key,
+                b => b.Tier,
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var snapshot in snapshots)
+            {
+                var key = snapshot.BookmakerKey ?? snapshot.BookmakerName;
+                if (bookmakersByKey.TryGetValue(key, out var tier))
+                {
+                    snapshot.BookType = tier;
+                }
+            }
+        }
+
+        private static void DetectFirstMover(MarketFingerprint fingerprint, MarketFingerprint? previous)
+        {
+            if (previous is null || fingerprint.DeltaMagnitude < 0.5m)
+                return;
+
+            // Find the book that moved first (earliest timestamp with different line)
+            var movers = fingerprint.BookSnapshots
+                .Where(s => Math.Abs(s.Line - previous.ConsensusLine) >= 0.5m)
+                .OrderBy(s => s.Timestamp)
+                .ToList();
+
+            if (movers.Count > 0)
+            {
+                var firstMover = movers[0];
+                fingerprint.FirstMoverBook = firstMover.BookmakerName;
+                fingerprint.FirstMoverType = firstMover.BookType;
+                fingerprint.FirstMoveTime = firstMover.Timestamp;
+            }
+        }
+
+        private static void CalculateVelocity(MarketFingerprint fingerprint, MarketFingerprint? previous)
+        {
+            if (previous is null)
+            {
+                fingerprint.Velocity = 0;
+                return;
+            }
+
+            var timeDiff = fingerprint.Timestamp - previous.Timestamp;
+            if (timeDiff.TotalHours < 0.01) // Avoid division by near-zero
+            {
+                fingerprint.Velocity = 0;
+                return;
+            }
+
+            fingerprint.Velocity = fingerprint.DeltaMagnitude / (decimal)timeDiff.TotalHours;
+        }
+
+        private static void CalculateRetailLag(MarketFingerprint fingerprint)
+        {
+            if (fingerprint.FirstMoveTime is null || fingerprint.FirstMoverType == BookmakerTier.Retail)
+                return;
+
+            // Find when retail books caught up
+            var retailMovers = fingerprint.BookSnapshots
+                .Where(s => s.BookType == BookmakerTier.Retail &&
+                           Math.Abs(s.Line - fingerprint.ConsensusLine) < 0.5m)
+                .OrderBy(s => s.Timestamp)
+                .FirstOrDefault();
+
+            if (retailMovers is not null)
+            {
+                fingerprint.RetailLag = retailMovers.Timestamp - fingerprint.FirstMoveTime.Value;
+            }
+        }
+
+        private static void TrackStability(MarketFingerprint fingerprint, MarketFingerprint? previous)
+        {
+            if (previous is null)
+                return;
+
+            // Check for reversal (line moved back toward previous)
+            var currentDirection = Math.Sign(fingerprint.ConsensusLine - fingerprint.PreviousConsensusLine);
+            var previousDirection = Math.Sign(previous.ConsensusLine - previous.PreviousConsensusLine);
+
+            if (currentDirection != 0 && previousDirection != 0 && currentDirection != previousDirection)
+            {
+                fingerprint.LastReversalTime = DateTime.UtcNow;
+            }
+            else
+            {
+                fingerprint.LastReversalTime = previous.LastReversalTime;
+            }
+        }
+
+        private static string GenerateContentHash(MarketFingerprint fingerprint)
+        {
+            var content = new
+            {
+                fingerprint.Market.Key,
+                fingerprint.ConsensusLine,
+                Books = fingerprint.BookSnapshots
+                    .Select(s => new { s.BookmakerKey, s.Line })
+                    .OrderBy(s => s.BookmakerKey)
+            };
+
+            var json = JsonSerializer.Serialize(content);
+            var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
+            return Convert.ToBase64String(bytes)[..16];
         }
     }
 }

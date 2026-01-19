@@ -1,5 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
-using OddsTracker.Core.Models;
+using static OddsTracker.Core.Models.Entities;
 
 namespace OddsTracker.Core.Data
 {
@@ -7,10 +7,28 @@ namespace OddsTracker.Core.Data
     {
         public DbSet<SignalSnapshotEntity> SignalSnapshots => Set<SignalSnapshotEntity>();
         public DbSet<UserSubscriptionEntity> UserSubscriptions => Set<UserSubscriptionEntity>();
+        public DbSet<SportEntity> Sports => Set<SportEntity>();
+        public DbSet<MarketDefinitionEntity> MarketDefinitions => Set<MarketDefinitionEntity>();
+        public DbSet<SportMarketEntity> SportMarkets => Set<SportMarketEntity>();
+        public DbSet<BookmakerEntity> Bookmakers => Set<BookmakerEntity>();
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             base.OnModelCreating(modelBuilder);
+
+            modelBuilder.Entity<BookmakerEntity>(entity =>
+            {
+                entity.ToTable("Bookmakers");
+                entity.HasKey(e => e.Id);
+                entity.HasIndex(e => e.Key).IsUnique();
+                entity.HasIndex(e => e.Tier);
+                entity.HasIndex(e => e.RequiredTier);
+                entity.Property(e => e.Key).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.DisplayName).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.Tier).HasMaxLength(20).IsRequired();
+                entity.Property(e => e.RequiredTier).HasMaxLength(20).IsRequired();
+                entity.Property(e => e.Region).HasMaxLength(50).IsRequired();
+            });
 
             modelBuilder.Entity<SignalSnapshotEntity>(entity =>
             {
@@ -58,6 +76,54 @@ namespace OddsTracker.Core.Data
                     .IsUnique();
 
                 entity.HasIndex(e => e.StripeCustomerId);
+            });
+
+            modelBuilder.Entity<SportEntity>(entity =>
+            {
+                entity.ToTable("Sports");
+                entity.HasKey(e => e.Id);
+                entity.HasIndex(e => e.Key).IsUnique();
+                entity.HasIndex(e => e.Category);
+                entity.Property(e => e.Key).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.DisplayName).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.Category).HasMaxLength(50).IsRequired();
+                entity.Property(e => e.PeriodType).HasMaxLength(50).IsRequired();
+            });
+
+            // MarketDefinition
+            modelBuilder.Entity<MarketDefinitionEntity>(entity =>
+            {
+                entity.ToTable("MarketDefinitions");
+                entity.HasKey(e => e.Id);
+                entity.HasIndex(e => e.Key).IsUnique();
+                entity.HasIndex(e => e.Category);
+                entity.HasIndex(e => e.IsPlayerProp);
+                entity.Property(e => e.Key).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.DisplayName).HasMaxLength(150).IsRequired();
+                entity.Property(e => e.Category).HasMaxLength(50).IsRequired();
+                entity.Property(e => e.OutcomeType).HasMaxLength(50).IsRequired();
+                entity.Property(e => e.RequiredTier).HasMaxLength(20).IsRequired();
+                entity.Property(e => e.Period).HasMaxLength(50);
+                entity.Property(e => e.Description).HasMaxLength(500);
+            });
+
+
+            modelBuilder.Entity<SportMarketEntity>(entity =>
+            {
+                entity.ToTable("SportMarkets");
+                entity.HasKey(e => new { e.SportId, e.MarketDefinitionId });
+
+                entity.HasOne(e => e.Sport)
+                    .WithMany(s => s.SportMarkets)
+                    .HasForeignKey(e => e.SportId)
+                    .OnDelete(DeleteBehavior.Cascade);
+
+                entity.HasOne(e => e.MarketDefinition)
+                    .WithMany(m => m.SportMarkets)
+                    .HasForeignKey(e => e.MarketDefinitionId)
+                    .OnDelete(DeleteBehavior.Cascade);
+
+                entity.HasIndex(e => e.MarketDefinitionId);
             });
         }
     }

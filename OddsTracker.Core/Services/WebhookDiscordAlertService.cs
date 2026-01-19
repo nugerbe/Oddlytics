@@ -67,7 +67,7 @@ namespace OddsTracker.Core.Services
         private static WebhookEmbed BuildEmbed(MarketAlert alert)
         {
             var market = alert.Fingerprint.Market;
-            var marketName = market.MarketType.ToDisplayName();
+            var marketName = market.MarketType.DisplayName;
             var gameName = $"{market.AwayTeam} @ {market.HomeTeam}";
 
             var emoji = alert.Type switch

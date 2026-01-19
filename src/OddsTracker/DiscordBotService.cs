@@ -10,7 +10,6 @@ namespace OddsTracker
 {
     /// <summary>
     /// Discord bot service for handling user interactions.
-    /// Alert sending has been moved to Azure Functions (WebhookDiscordAlertService).
     /// </summary>
     public class DiscordBotService : BackgroundService
     {
@@ -331,14 +330,14 @@ namespace OddsTracker
             }
         }
 
-        private Embed BuildAlertEmbed(MarketAlert alert)
+        private static Embed BuildAlertEmbed(MarketAlert alert)
         {
             var emoji = GetAlertTypeEmoji(alert.Type);
             var color = GetAlertPriorityColor(alert.Priority);
             var market = alert.Fingerprint.Market;
 
             // Format market type as readable name
-            var marketName = market.MarketType.ToDisplayName();
+            var marketName = market.MarketType.DisplayName;
 
             // Format game as "Away @ Home"
             var gameName = $"{market.AwayTeam} @ {market.HomeTeam}";

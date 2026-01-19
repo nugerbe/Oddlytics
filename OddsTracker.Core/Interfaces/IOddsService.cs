@@ -4,6 +4,6 @@ namespace OddsTracker.Core.Interfaces
 {
     public interface IOddsService
     {
-        Task<List<NormalizedOdds>> GetOddsAsync(OddsQuery query, SubscriptionTier userTier);
+        Task<List<OddsBase>> GetOddsAsync(OddsQueryBase query, SubscriptionTier userTier);
     }
 }

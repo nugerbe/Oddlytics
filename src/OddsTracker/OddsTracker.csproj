@@ -8,6 +8,7 @@
 		<UserSecretsId>odds-tracker-secrets</UserSecretsId>
 		<!-- Allow this project to be referenced by other projects -->
 		<EnableDynamicLoading>true</EnableDynamicLoading>
+		<DisableImplicitNamespaceImports>false</DisableImplicitNamespaceImports>
 	</PropertyGroup>
 
   <ItemGroup>
@@ -34,10 +35,10 @@
 
 <ItemGroup>
 	<Content Include="appsettings.json">
-		<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 	</Content>
 	<Content Include="appsettings.*.json">
-		<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 	</Content>
 </ItemGroup>
 

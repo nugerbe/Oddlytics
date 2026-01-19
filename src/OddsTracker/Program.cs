@@ -32,24 +32,16 @@ if (!string.IsNullOrEmpty(keyVaultUrl))
 {
     Console.WriteLine($"Loading secrets from Azure Key Vault: {keyVaultUrl}");
 
-    // DefaultAzureCredential tries multiple auth methods in order:
-    // 1. Environment variables (disabled for local dev)
-    // 2. Workload Identity (disabled for local dev)
-    // 3. Managed Identity (works in Azure)
-    // 4. Azure CLI (works locally after 'az login')
-    // 5. Visual Studio / VS Code credentials
     var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
     {
         ExcludeEnvironmentCredential = true,
         ExcludeWorkloadIdentityCredential = true,
-        TenantId = builder.Configuration["Azure:TenantId"] // Optional: specify tenant
+        TenantId = builder.Configuration["Azure:TenantId"]
     });
 
     builder.Configuration.AddAzureKeyVault(new Uri(keyVaultUrl), credential);
     Console.WriteLine("Successfully connected to Key Vault");
 
-    // Load environment-specific connection string
-    // Key Vault has: ConnectionStrings--DefaultConnection--Dev and ConnectionStrings--DefaultConnection--Prod
     var envSuffix = builder.Environment.IsProduction() ? "Prod" : "Dev";
     var envConnectionString = builder.Configuration[$"ConnectionStrings:DefaultConnection:{envSuffix}"];
     if (!string.IsNullOrEmpty(envConnectionString))
@@ -62,7 +54,6 @@ if (!string.IsNullOrEmpty(keyVaultUrl))
         Console.WriteLine($"WARNING: No connection string found for ConnectionStrings:DefaultConnection:{envSuffix}");
     }
 
-    // Debug: Check if secrets loaded
     var discordToken = builder.Configuration["AppSettings:DiscordToken"];
     var claudeKey = builder.Configuration["AppSettings:ClaudeApiKey"];
     var oddsKey = builder.Configuration["AppSettings:TheOddsApiKey"];
@@ -73,7 +64,7 @@ if (!string.IsNullOrEmpty(keyVaultUrl))
     Console.WriteLine($"ConnectionString loaded: {!string.IsNullOrEmpty(connStr)}");
 }
 
-// Redis Cache
+// Redis Cache - ALWAYS ensure IDistributedCache is registered
 if (builder.Configuration.GetValue<bool>("Cache:Enabled"))
 {
     bool useExternalCache = builder.Configuration.GetValue<bool>("Cache:UseExternalCache");
@@ -85,26 +76,26 @@ if (builder.Configuration.GetValue<bool>("Cache:Enabled"))
         options.InstanceName = "OddsTracker:";
     });
 }
+else
+{
+    builder.Services.AddDistributedMemoryCache();
+}
 
 // EF Core - Azure SQL Database
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 if (!string.IsNullOrEmpty(connectionString))
 {
-    builder.Services.AddDbContextPool<OddsTrackerDbContext>(options =>
+    builder.Services.AddPooledDbContextFactory<OddsTrackerDbContext>(options =>
     {
         options.UseSqlServer(connectionString, sqlOptions =>
         {
-            // Azure SQL resiliency - retries on transient failures
             sqlOptions.EnableRetryOnFailure(
                 maxRetryCount: 5,
                 maxRetryDelay: TimeSpan.FromSeconds(30),
                 errorNumbersToAdd: null);
-
-            // Command timeout for Azure
             sqlOptions.CommandTimeout(30);
         });
 
-        // Use Managed Identity in Production only
         if (builder.Environment.IsProduction())
         {
             var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
@@ -124,41 +115,15 @@ if (!string.IsNullOrEmpty(connectionString))
     });
 
     builder.Services.AddScoped<IHistoricalRepository, HistoricalRepository>();
+    builder.Services.AddScoped<ISubscriptionRepository, SubscriptionRepository>();
 }
 else
 {
-    // Fallback to in-memory for development without DB
     builder.Services.AddSingleton<IHistoricalRepository, InMemoryHistoricalRepository>();
     Console.WriteLine("No connection string - using in-memory repository");
 }
 
-// The Odds API Client
-builder.Services.AddHttpClient<IOddsApiClient, OddsApiClient>((sp, client) =>
-{
-    client.DefaultRequestHeaders.Add("Accept", "application/json");
-}).AddTypedClient<IOddsApiClient>((httpClient, sp) =>
-{
-    var config = sp.GetRequiredService<IConfiguration>();
-    var apiKey = config["AppSettings:TheOddsApiKey"]
-        ?? throw new InvalidOperationException("TheOddsApiKey not configured");
-    return new OddsApiClient(httpClient, apiKey);
-});
-
-// Chart Service
-builder.Services.AddHttpClient<IChartService, QuickChartService>();
-
-// Anthropic Client - uses ANTHROPIC_API_KEY env var by default, or configure explicitly
-builder.Services.AddSingleton(_ =>
-{
-    var apiKey = builder.Configuration["AppSettings:ClaudeApiKey"];
-    if (!string.IsNullOrEmpty(apiKey))
-    {
-        Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", apiKey);
-    }
-    return new AnthropicClient();
-});
-
-// Configure options
+// Configure options FIRST
 builder.Services.Configure<CacheOptions>(builder.Configuration.GetSection("Cache"));
 builder.Services.Configure<AlertEngineOptions>(builder.Configuration.GetSection("AlertEngine"));
 builder.Services.Configure<ConfidenceScoringOptions>(builder.Configuration.GetSection("ConfidenceScoring"));
@@ -176,35 +141,99 @@ builder.Services.Configure<DiscordBotOptions>(options =>
     options.SharpRoleId = discord.GetValue<ulong>("SharpRoleId");
 });
 
-// Services - EnhancedCacheService implements both ICacheService and IEnhancedCacheService
+// ============================================
+// SERVICE REGISTRATION ORDER (NO CYCLES)
+// ============================================
+
+// 1. Core infrastructure (no dependencies)
+builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<EnhancedCacheService>();
 builder.Services.AddSingleton<ICacheService>(sp => sp.GetRequiredService<EnhancedCacheService>());
 builder.Services.AddSingleton<IEnhancedCacheService>(sp => sp.GetRequiredService<EnhancedCacheService>());
 
-builder.Services.AddSingleton<IClaudeService, ClaudeService>();
-builder.Services.AddSingleton<ISportsDataService, SportsDataService>();
-builder.Services.AddSingleton<IQueryParser, LocalQueryParser>();
-builder.Services.AddSingleton<IOddsService, OddsService>();
-builder.Services.AddSingleton<IOddsOrchestrator, OddsOrchestrator>();
+// 2. Named HttpClients
+builder.Services.AddHttpClient("OddsApi", client =>
+{
+    client.DefaultRequestHeaders.Add("Accept", "application/json");
+});
+builder.Services.AddHttpClient("ChartService");
 
-// New platform services
+// 4. OddsApiClient (simple - only HttpClient, apiKey, logger)
+builder.Services.AddSingleton<IOddsApiClient>(sp =>
+{
+    var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
+    var httpClient = httpClientFactory.CreateClient("OddsApi");
+    var config = sp.GetRequiredService<IConfiguration>();
+    var apiKey = config["AppSettings:TheOddsApiKey"]
+        ?? throw new InvalidOperationException("TheOddsApiKey not configured");
+    var logger = sp.GetRequiredService<ILogger<OddsApiClient>>();
+
+    return new OddsApiClient(httpClient, apiKey, logger);
+});
+
+// 6. Chart Service
+builder.Services.AddSingleton<IChartService>(sp =>
+{
+    var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
+    var httpClient = httpClientFactory.CreateClient("ChartService");
+    var logger = sp.GetRequiredService<ILogger<QuickChartService>>();
+    return new QuickChartService(httpClient, logger);
+});
+
+// 7. Anthropic Client
+builder.Services.AddSingleton(_ =>
+{
+    var apiKey = builder.Configuration["AppSettings:ClaudeApiKey"];
+    if (!string.IsNullOrEmpty(apiKey))
+    {
+        Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", apiKey);
+    }
+    return new AnthropicClient();
+});
+
+// 8. Sports Data Service
+builder.Services.AddSingleton<ISportsDataService, SportsDataService>();
+
+// 9. OddsService (depends on OddsApiClient, SportsDataService, MarketAccessService)
+builder.Services.AddSingleton<IOddsService>(sp =>
+{
+    var oddsClient = sp.GetRequiredService<IOddsApiClient>();
+    var sportsDataService = sp.GetRequiredService<ISportsDataService>();
+    var marketRepository = sp.GetRequiredService<IMarketRepository>();
+    var logger = sp.GetRequiredService<ILogger<OddsService>>();
+
+    return new OddsService(oddsClient, sportsDataService, marketRepository, logger);
+});
+
+// 10. Claude and Query parsing services
+builder.Services.AddSingleton<IClaudeService, ClaudeService>();
+builder.Services.AddSingleton<IQueryParser, LocalQueryParser>();
+
+// 11. Orchestrator
+builder.Services.AddSingleton<IOddsOrchestrator>(sp =>
+{
+    var localParser = sp.GetRequiredService<IQueryParser>();
+    var claudeService = sp.GetRequiredService<IClaudeService>();
+    var oddsService = sp.GetRequiredService<IOddsService>();
+    var chartService = sp.GetRequiredService<IChartService>();
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
+    var marketRepository = sp.GetRequiredService<IMarketRepository>();
+    var logger = sp.GetRequiredService<ILogger<OddsOrchestrator>>();
+    return new OddsOrchestrator(localParser, claudeService, oddsService, chartService, cacheService, marketRepository, logger);
+});
+
+// 12. Alert and tracking services
 builder.Services.AddSingleton<IMovementFingerprintService, MovementFingerprintService>();
 builder.Services.AddSingleton<IConfidenceScoringEngine, ConfidenceScoringEngine>();
 builder.Services.AddSingleton<IAlertEngine, AlertEngine>();
 builder.Services.AddSingleton<IHistoricalTracker, HistoricalTracker>();
-builder.Services.AddSingleton<ISubscriptionManager, SubscriptionManager>();
-builder.Services.AddScoped<ISubscriptionRepository, EfSubscriptionRepository>();
-builder.Services.AddSingleton<IMarketAccessService, MarketAccessService>();
 
-// Discord Bot (runs as hosted service for user interaction only)
-// Alert sending is now handled by Azure Functions via webhooks
+// 13. Subscription services
+builder.Services.AddSingleton<ISubscriptionManager, SubscriptionManager>();
+
+// 14. Discord Bot
 builder.Services.AddSingleton<DiscordBotService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DiscordBotService>());
-
-// NOTE: OddsPollerService and OutcomeUpdateService have been moved to Azure Functions
-// See: src/OddsTracker.Functions/
-// - OddsPollerFunction (Timer: every 60s)
-// - OutcomeUpdateFunction (Timer: every 15min)
 
 // Logging
 builder.Services.AddLogging(logging =>
@@ -218,4 +247,12 @@ var host = builder.Build();
 Console.WriteLine("Starting OddsTracker Bot...");
 Console.WriteLine("Press Ctrl+C to stop.");
 
-await host.RunAsync();
+try
+{
+    await host.RunAsync();
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Host error: {ex}");
+    throw;
+}

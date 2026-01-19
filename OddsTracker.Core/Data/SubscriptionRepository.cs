@@ -1,13 +1,14 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using OddsTracker.Core.Models;
 using OddsTracker.Core.Interfaces;
+using static OddsTracker.Core.Models.Entities;
 
 namespace OddsTracker.Core.Data
 {
     /// <summary>
     /// EF Core implementation of subscription repository.
     /// </summary>
-    public class EfSubscriptionRepository(OddsTrackerDbContext context) : ISubscriptionRepository
+    public class SubscriptionRepository(OddsTrackerDbContext context) : ISubscriptionRepository
     {
         public async Task<UserSubscription?> GetByDiscordIdAsync(ulong discordUserId)
         {

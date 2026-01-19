@@ -8,9 +8,6 @@ namespace OddsTracker.Core.Services
 {
     public class QuickChartService(HttpClient httpClient, ILogger<QuickChartService> logger) : IChartService
     {
-        private readonly HttpClient _httpClient = httpClient;
-        private readonly ILogger<QuickChartService> _logger = logger;
-
         private const string BaseUrl = "https://quickchart.io/chart";
 
         // Colors for different bookmakers
@@ -26,22 +23,26 @@ namespace OddsTracker.Core.Services
             ["lowvig"] = "rgb(102, 0, 102)",
             ["betus"] = "rgb(0, 100, 0)",
             ["bovada"] = "rgb(0, 128, 0)",
-            ["mybookieag"] = "rgb(128, 0, 128)"
+            ["mybookieag"] = "rgb(128, 0, 128)",
+            ["pinnacle"] = "rgb(0, 51, 102)",
+            ["espnbet"] = "rgb(204, 0, 0)",
+            ["pointsbetus"] = "rgb(0, 153, 76)"
         };
 
-        public async Task<byte[]> GenerateChartAsync(List<NormalizedOdds> odds, OddsQuery query, TeamSide side = TeamSide.Home)
+        public async Task<byte[]> GenerateChartAsync(List<OddsBase> odds, OddsQueryBase query, TeamSide side = TeamSide.Home)
         {
-            if (odds.Count == 0 || odds.SelectMany(o => o.Snapshots).Any() == false)
+            if (odds.Count == 0 || !odds.SelectMany(o => o.Snapshots).Any())
             {
                 throw new InvalidOperationException("No odds data available to chart");
             }
 
-            var game = odds[0];
-            var chartData = BuildChartData(game, query, side);
+            var oddsData = odds[0];
+            var market = query.MarketDefinition;
+            var chartData = BuildChartData(oddsData, market, side);
 
             // Calculate y-axis bounds based on actual data
-            var allValues = game.Snapshots
-                .Select(s => GetValueForMarketType(s, query.MarketType, side))
+            var allValues = oddsData.Snapshots
+                .Select(s => GetValueForMarket(s, market, side))
                 .Where(v => v.HasValue)
                 .Select(v => v!.Value)
                 .ToList();
@@ -54,15 +55,7 @@ namespace OddsTracker.Core.Services
             yMin -= padding;
             yMax += padding;
 
-            // Build title based on market type and team side
-            var teamName = side == TeamSide.Home ? game.HomeTeam : game.AwayTeam;
-            var title = query.MarketType switch
-            {
-                MarketType.Total => $"{game.AwayTeam} @ {game.HomeTeam} - Total (O/U)",
-                MarketType.Spread => $"{teamName} Spread Movement",
-                MarketType.Moneyline => $"{teamName} Moneyline Movement",
-                _ => $"{game.AwayTeam} @ {game.HomeTeam} - {query.MarketType}"
-            };
+            var title = BuildChartTitle(oddsData, market, side);
 
             var chartConfig = new
             {
@@ -100,7 +93,7 @@ namespace OddsTracker.Core.Services
                                 scaleLabel = new
                                 {
                                     display = true,
-                                    labelString = GetYAxisLabel(query.MarketType, side)
+                                    labelString = GetYAxisLabel(market, side)
                                 }
                             }
                         }
@@ -117,25 +110,50 @@ namespace OddsTracker.Core.Services
             var encodedChart = HttpUtility.UrlEncode(json);
             var url = $"{BaseUrl}?c={encodedChart}&width=800&height=400&backgroundColor=white";
 
-            _logger.LogDebug("Generating chart from QuickChart. Y-axis range: {Min} to {Max}", yMin, yMax);
+            logger.LogDebug("Generating chart from QuickChart. Y-axis range: {Min} to {Max}", yMin, yMax);
 
-            var response = await _httpClient.GetAsync(url);
+            var response = await httpClient.GetAsync(url);
             response.EnsureSuccessStatusCode();
 
             return await response.Content.ReadAsByteArrayAsync();
         }
 
-        private static object BuildChartData(NormalizedOdds game, OddsQuery query, TeamSide side)
+        private static string BuildChartTitle(OddsBase odds, MarketDefinition market, TeamSide side)
+        {
+            return odds switch
+            {
+                GameOdds game => market.OutcomeType switch
+                {
+                    // Totals - show O/U
+                    OutcomeType.OverUnder when !market.IsPlayerProp =>
+                        $"{game.AwayTeam} @ {game.HomeTeam} - {market.DisplayName} (O/U)",
+
+                    // Team-based spreads/moneylines - show team name
+                    OutcomeType.TeamBased =>
+                        $"{(side == TeamSide.Home ? game.HomeTeam : game.AwayTeam)} {market.DisplayName} Movement",
+
+                    // Default
+                    _ => $"{game.AwayTeam} @ {game.HomeTeam} - {market.DisplayName}"
+                },
+
+                PlayerOdds player =>
+                    $"{player.PlayerName} - {market.DisplayName}",
+
+                _ => "Odds Movement"
+            };
+        }
+
+        private static object BuildChartData(OddsBase oddsData, MarketDefinition market, TeamSide side)
         {
             var datasets = new List<object>();
 
-            var snapshotsByBook = game.Snapshots
+            var snapshotsByBook = oddsData.Snapshots
                 .GroupBy(s => s.BookmakerName)
                 .ToList();
 
             // Different point styles for each bookmaker
             var pointStyles = new[] { "circle", "rect", "triangle", "rectRot", "cross", "crossRot", "star", "rectRounded" };
-            var lineStyles = new[] { Array.Empty<int>(), new[] { 5, 5 }, new[] { 10, 5 }, new[] { 2, 2 } };
+            var lineStyles = new int[][] { [], [5, 5], [10, 5], [2, 2] };
 
             var bookIndex = 0;
             foreach (var bookGroup in snapshotsByBook)
@@ -149,7 +167,7 @@ namespace OddsTracker.Core.Services
                     .Select(s => new
                     {
                         x = s.Timestamp.ToString("o"),
-                        y = GetValueForMarketType(s, query.MarketType, side)
+                        y = GetValueForMarket(s, market, side)
                     })
                     .Where(p => p.y.HasValue)
                     .ToList();
@@ -181,30 +199,66 @@ namespace OddsTracker.Core.Services
             return new { datasets };
         }
 
-        private static decimal? GetValueForMarketType(BookSnapshot snapshot, MarketType marketType, TeamSide side)
+        private static decimal? GetValueForMarket(BookSnapshotBase snapshot, MarketDefinition market, TeamSide side)
         {
-            return marketType switch
+            return snapshot switch
             {
-                MarketType.Spread => side == TeamSide.Home
-                    ? snapshot.Line
-                    : -snapshot.Line,
-                MarketType.Total => snapshot.Line,
-                MarketType.Moneyline => side == TeamSide.Home
-                    ? snapshot.HomeOdds
-                    : snapshot.AwayOdds,
+                GameBookSnapshot game => market.OutcomeType switch
+                {
+                    // Spreads - flip sign for away team
+                    OutcomeType.TeamBased when market.Key.Contains("spread", StringComparison.OrdinalIgnoreCase) =>
+                        side == TeamSide.Home ? game.Line : -game.Line,
+
+                    // Totals - just use the line
+                    OutcomeType.OverUnder =>
+                        game.Line,
+
+                    // Moneylines - use the appropriate team's odds
+                    OutcomeType.TeamBased when market.Key.Contains("h2h", StringComparison.OrdinalIgnoreCase) =>
+                        side == TeamSide.Home ? game.HomeOdds : game.AwayOdds,
+
+                    // Default team-based with point (other spreads)
+                    OutcomeType.TeamBased =>
+                        side == TeamSide.Home ? game.Line : -game.Line,
+
+                    // Default
+                    _ => game.Line
+                },
+
+                PlayerBookSnapshot player =>
+                    player.Line,
+
                 _ => snapshot.Line
             };
         }
 
-        private static string GetYAxisLabel(MarketType marketType, TeamSide side)
+        private static string GetYAxisLabel(MarketDefinition market, TeamSide side)
         {
-            var teamLabel = side == TeamSide.Home ? "Home" : "Away";
-            return marketType switch
+            // Player props - use display name
+            if (market.IsPlayerProp)
             {
-                MarketType.Spread => $"Spread ({teamLabel} Team)",
-                MarketType.Total => "Total Points (O/U)",
-                MarketType.Moneyline => $"Moneyline ({teamLabel} Team)",
-                _ => "Value"
+                return market.DisplayName;
+            }
+
+            var teamLabel = side == TeamSide.Home ? "Home" : "Away";
+
+            return market.OutcomeType switch
+            {
+                // Totals
+                OutcomeType.OverUnder => "Total Points (O/U)",
+
+                // Team-based
+                OutcomeType.TeamBased => market.Key switch
+                {
+                    var k when k.Contains("spread", StringComparison.OrdinalIgnoreCase) =>
+                        $"Spread ({teamLabel} Team)",
+                    var k when k.Contains("h2h", StringComparison.OrdinalIgnoreCase) =>
+                        $"Moneyline ({teamLabel} Team)",
+                    _ => $"{market.DisplayName} ({teamLabel} Team)"
+                },
+
+                // Default
+                _ => market.DisplayName
             };
         }
     }

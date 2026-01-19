@@ -4,7 +4,7 @@ namespace OddsTracker.Core.Interfaces
 {
     public interface IClaudeService
     {
-        Task<OddsQuery?> ParseQueryAsync(string userMessage);
-        Task<string> AnalyzeOddsMovementAsync(NormalizedOdds odds, OddsQuery query, TeamSide side);
+        Task<OddsQueryBase?> ParseQueryAsync(string userMessage);
+        Task<string> AnalyzeOddsMovementAsync(OddsBase odds, OddsQueryBase query, TeamSide side);
     }
 }

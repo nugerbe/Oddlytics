@@ -12,12 +12,13 @@ namespace OddsTracker.Core.Services
     /// 
     /// <para><b>Redis Key Schema:</b></para>
     /// <list type="bullet">
-    ///   <item>Raw odds: <c>odds:raw:{eventId}:{marketType}</c></item>
-    ///   <item>Fingerprints: <c>fingerprint:{eventId}:{marketType}</c></item>
+    ///   <item>Raw odds: <c>odds:raw:{eventId}:{marketKey}</c></item>
+    ///   <item>Fingerprints: <c>fingerprint:{eventId}:{marketKey}</c></item>
     ///   <item>Confidence scores: <c>confidence:{marketKey}</c></item>
     ///   <item>AI explanations: <c>ai:explain:{promptHash}</c></item>
     ///   <item>User subscriptions: <c>subscription:{userId}</c></item>
     ///   <item>Rate limits: <c>ratelimit:{userId}</c></item>
+    ///   <item>Charts: <c>chart:{cacheKey}:{side}</c></item>
     /// </list>
     /// 
     /// <para><b>Invalidation Rules:</b></para>
@@ -36,7 +37,7 @@ namespace OddsTracker.Core.Services
 
         public bool IsEnabled => _options.Enabled;
 
-        // Generic cache operations
+        #region Generic Cache Operations
 
         public async Task<T?> GetAsync<T>(string key) where T : class
         {
@@ -110,6 +111,7 @@ namespace OddsTracker.Core.Services
                 };
 
                 await cache.SetAsync(key, value, cacheOptions);
+                logger.LogDebug("Cache set (bytes): {Key}, TTL: {TTL}", key, expiry ?? TimeSpan.FromMinutes(_options.DefaultTtlMinutes));
             }
             catch (Exception ex)
             {
@@ -133,18 +135,22 @@ namespace OddsTracker.Core.Services
             }
         }
 
-        // Fingerprint cache
+        #endregion
 
-        public async Task<MarketFingerprint?> GetFingerprintAsync(string eventId, MarketType marketType) =>
-            await GetAsync<MarketFingerprint>($"fingerprint:{eventId}:{marketType}");
+        #region Fingerprint Cache
+
+        public async Task<MarketFingerprint?> GetFingerprintAsync(string eventId, string marketKey) =>
+            await GetAsync<MarketFingerprint>($"fingerprint:{eventId}:{marketKey}");
 
         public async Task SetFingerprintAsync(MarketFingerprint fingerprint) =>
             await SetAsync(
-                $"fingerprint:{fingerprint.Market.EventId}:{fingerprint.Market.MarketType}",
+                $"fingerprint:{fingerprint.Market.EventId}:{fingerprint.Market.MarketType.Key}",
                 fingerprint,
                 TimeSpan.FromHours(_options.FingerprintTtlHours));
 
-        // Confidence score cache
+        #endregion
+
+        #region Confidence Score Cache
 
         public async Task<ConfidenceScore?> GetConfidenceScoreAsync(string marketKey) =>
             await GetAsync<ConfidenceScore>($"confidence:{marketKey}");
@@ -155,7 +161,9 @@ namespace OddsTracker.Core.Services
                 score,
                 TimeSpan.FromMinutes(_options.ConfidenceTtlMinutes));
 
-        // AI explanation cache
+        #endregion
+
+        #region AI Explanation Cache
 
         public async Task<string?> GetAIExplanationAsync(string promptHash) =>
             await GetAsync<string>($"ai:explain:{promptHash}");
@@ -166,7 +174,9 @@ namespace OddsTracker.Core.Services
                 explanation,
                 TimeSpan.FromMinutes(_options.AIExplanationTtlMinutes));
 
-        // User subscription cache
+        #endregion
+
+        #region User Subscription Cache
 
         public async Task<UserSubscription?> GetUserSubscriptionAsync(ulong userId) =>
             await GetAsync<UserSubscription>($"subscription:{userId}");
@@ -177,7 +187,9 @@ namespace OddsTracker.Core.Services
                 subscription,
                 TimeSpan.FromMinutes(_options.SubscriptionTtlMinutes));
 
-        // Rate limit cache
+        #endregion
+
+        #region Rate Limit Cache
 
         public async Task<RateLimitEntry?> GetRateLimitAsync(ulong userId) =>
             await GetAsync<RateLimitEntry>($"ratelimit:{userId}");
@@ -189,18 +201,20 @@ namespace OddsTracker.Core.Services
             await SetAsync($"ratelimit:{entry.UserId}", entry, effectiveTtl);
         }
 
-        // Invalidation
+        #endregion
 
-        public async Task InvalidateMarketAsync(string eventId, MarketType marketType)
+        #region Invalidation
+
+        public async Task InvalidateMarketAsync(string eventId, string marketKey)
         {
             if (!_options.Enabled)
                 return;
 
             string[] keys =
             [
-                $"fingerprint:{eventId}:{marketType}",
-                $"confidence:{eventId}:{marketType}",
-                $"odds:raw:{eventId}:{marketType}"
+                $"fingerprint:{eventId}:{marketKey}",
+                $"confidence:{eventId}:{marketKey}",
+                $"odds:raw:{eventId}:{marketKey}"
             ];
 
             foreach (var key in keys)
@@ -208,20 +222,33 @@ namespace OddsTracker.Core.Services
                 await cache.RemoveAsync(key);
             }
 
-            logger.LogInformation("Invalidated cache for market: {EventId}:{MarketType}", eventId, marketType);
+            logger.LogInformation("Invalidated cache for market: {EventId}:{MarketKey}", eventId, marketKey);
         }
 
-        public async Task InvalidateEventAsync(string eventId)
+        public async Task InvalidateEventAsync(string eventId, IEnumerable<string>? marketKeys = null)
         {
             if (!_options.Enabled)
                 return;
 
-            foreach (var marketType in Enum.GetValues<MarketType>())
+            if (marketKeys is not null)
             {
-                await InvalidateMarketAsync(eventId, marketType);
+                // Invalidate specific markets
+                foreach (var marketKey in marketKeys)
+                {
+                    await InvalidateMarketAsync(eventId, marketKey);
+                }
+            }
+            else
+            {
+                // Without market keys, we can only log a warning
+                // In production, you'd want to track active markets per event
+                logger.LogWarning(
+                    "InvalidateEventAsync called without market keys for {EventId}. " +
+                    "Consider passing market keys for complete invalidation.",
+                    eventId);
             }
 
-            logger.LogInformation("Invalidated all caches for event: {EventId}", eventId);
+            logger.LogInformation("Invalidated caches for event: {EventId}", eventId);
         }
 
         public async Task InvalidateUserAsync(ulong userId)
@@ -242,5 +269,7 @@ namespace OddsTracker.Core.Services
 
             logger.LogInformation("Invalidated cache for user: {UserId}", userId);
         }
+
+        #endregion
     }
 }

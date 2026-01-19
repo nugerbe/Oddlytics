@@ -19,12 +19,14 @@ namespace OddsTracker.Core.Services
 
         public async Task RecordSignalAsync(MarketFingerprint fingerprint, ConfidenceScore confidence)
         {
+            var market = fingerprint.Market;
+
             var snapshot = new SignalSnapshot
             {
-                EventId = fingerprint.Market.EventId,
-                MarketType = fingerprint.Market.MarketType,
+                EventId = market.EventId,
+                MarketKey = market.MarketType.Key,
                 SignalTime = DateTime.UtcNow,
-                GameTime = fingerprint.Market.CommenceTime,
+                GameTime = market.CommenceTime,
                 LineAtSignal = fingerprint.ConsensusLine,
                 ConfidenceAtSignal = confidence.Level,
                 ConfidenceScoreAtSignal = confidence.Score,
@@ -37,19 +39,19 @@ namespace OddsTracker.Core.Services
             await repository.SaveSignalAsync(snapshot);
 
             logger.LogInformation(
-                "Recorded signal: {EventId} {MarketType} Line={Line} Confidence={Confidence}",
+                "Recorded signal: {EventId} {MarketKey} Line={Line} Confidence={Confidence}",
                 snapshot.EventId,
-                snapshot.MarketType,
+                snapshot.MarketKey,
                 snapshot.LineAtSignal,
                 snapshot.ConfidenceAtSignal);
         }
 
-        public async Task UpdateOutcomeAsync(string eventId, MarketType marketType, decimal closingLine, SignalOutcome outcome)
+        public async Task UpdateOutcomeAsync(string eventId, string marketKey, decimal closingLine, SignalOutcome outcome)
         {
             using var scope = scopeFactory.CreateScope();
             var repository = scope.ServiceProvider.GetRequiredService<IHistoricalRepository>();
 
-            var signals = await repository.GetSignalsForEventAsync(eventId, marketType);
+            var signals = await repository.GetSignalsForEventAsync(eventId, marketKey);
 
             foreach (var signal in signals)
             {
@@ -59,10 +61,11 @@ namespace OddsTracker.Core.Services
                 await repository.UpdateSignalAsync(signal);
 
                 logger.LogInformation(
-                    "Updated outcome: {EventId} {MarketType} {Outcome}",
+                    "Updated outcome: {EventId} {MarketKey} Outcome={Outcome} ClosingLine={ClosingLine}",
                     eventId,
-                    marketType,
-                    signal.Outcome);
+                    marketKey,
+                    outcome,
+                    closingLine);
             }
         }
 

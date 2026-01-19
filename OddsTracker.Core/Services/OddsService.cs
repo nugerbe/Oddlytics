@@ -1,136 +1,150 @@
 ﻿using Microsoft.Extensions.Logging;
-using OddsTracker.Core.Models;
 using OddsTracker.Core.Interfaces;
+using OddsTracker.Core.Models;
 
 namespace OddsTracker.Core.Services
 {
-    public class OddsService : IOddsService
+    public class OddsService(
+        IOddsApiClient oddsClient,
+        ISportsDataService sportsDataService,
+        IMarketRepository marketRepository,
+        ILogger<OddsService> logger) : IOddsService
     {
-        private readonly IOddsApiClient _oddsClient;
-        private readonly ISportsDataService _sportsDataService;
-        private readonly IMarketAccessService _marketAccessService;
-        private readonly ILogger<OddsService> _logger;
-
-        public OddsService(
-            IOddsApiClient oddsClient,
-            ISportsDataService sportsDataService,
-            IMarketAccessService marketAccessService,
-            ILogger<OddsService> logger)
+        public async Task<List<OddsBase>> GetOddsAsync(OddsQueryBase query, SubscriptionTier userTier)
         {
-            _oddsClient = oddsClient;
-            _sportsDataService = sportsDataService;
-            _marketAccessService = marketAccessService;
-            _logger = logger;
+            var market = query.MarketDefinition;
+
+            // Check if user can access this market type
+            if (!marketRepository.CanAccessMarket(userTier, market.Key))
+            {
+                logger.LogWarning(
+                    "User tier {Tier} cannot access market {Market}. Required: {Required}",
+                    userTier, market.Key, market.RequiredTier);
+                return [];
+            }
+
+            return query switch
+            {
+                PlayerOddsQuery playerQuery => await GetPlayerOddsAsync(playerQuery, userTier),
+                GameOddsQuery gameQuery => await GetGameOddsAsync(gameQuery, userTier),
+                _ => throw new ArgumentException($"Unknown query type: {query.GetType().Name}")
+            };
         }
 
-        public async Task<List<NormalizedOdds>> GetOddsAsync(OddsQuery query, SubscriptionTier userTier)
+        private async Task<List<OddsBase>> GetPlayerOddsAsync(PlayerOddsQuery query, SubscriptionTier userTier)
         {
-            // Check if user can access this market type
-            if (!_marketAccessService.CanAccessMarket(userTier, query.MarketType))
-            {
-                _logger.LogWarning(
-                    "User tier {Tier} cannot access market {Market}. Required: {Required}",
-                    userTier, query.MarketType, query.MarketType.RequiredTier());
-                return [];
-            }
+            var market = query.MarketDefinition;
 
-            // If player prop with no team, look up the player's team
-            if (query.MarketType.IsPlayerProp() &&
-                !string.IsNullOrEmpty(query.PlayerName) &&
-                string.IsNullOrEmpty(query.HomeTeam))
+            // Resolve player's team if not specified
+            if (string.IsNullOrEmpty(query.Team))
             {
-                var playerInfo = await _sportsDataService.GetPlayerTeamAsync(query.PlayerName);
+                var playerInfo = await sportsDataService.GetPlayerTeamAsync(query.PlayerName);
                 if (playerInfo is not null)
                 {
-                    query.HomeTeam = playerInfo.TeamFullName;
-                    _logger.LogInformation(
-                        "Resolved player {Player} to team {Team}",
+                    query.Team = playerInfo.TeamFullName;
+                    logger.LogInformation("Resolved player {Player} to team {Team}",
                         query.PlayerName, playerInfo.TeamFullName);
-                }
-                else
-                {
-                    _logger.LogWarning(
-                        "Could not resolve player {Player} to a team. Query may fail.",
-                        query.PlayerName);
                 }
             }
 
-            // Get bookmakers accessible to this tier
-            var accessibleBookmakers = _marketAccessService.FilterBookmakersByTier(userTier);
+            var accessibleBookmakers = await marketRepository.GetAccessibleBookmakersAsync(userTier);
+            var markets = new[] { market.Key };
+            var bookmakers = accessibleBookmakers.Select(x => x.Key).ToArray();
 
-            _logger.LogInformation(
-                "Fetching odds for HomeTeam: {HomeTeam}, AwayTeam: {AwayTeam}, Market: {Market}, Player: {Player}, Tier: {Tier}, Bookmakers: {Books}",
-                query.HomeTeam, query.AwayTeam ?? "any", query.MarketType, query.PlayerName ?? "N/A",
-                userTier, string.Join(", ", accessibleBookmakers));
+            logger.LogInformation(
+                "Fetching player props for Player: {Player}, Market: {Market}, Sport: {Sport}, Tier: {Tier}",
+                query.PlayerName, market.Key, query.Sport, userTier);
 
-            // Use the extension method to get the API market key
-            var marketKey = query.MarketType.ToApiKey();
-            var markets = new[] { marketKey };
-
-            // Step 1: Get current odds to find the event ID (filtered by tier bookmakers)
-            var currentEvents = await _oddsClient.GetNflOddsAsync(markets, accessibleBookmakers);
-
+            var currentEvents = await oddsClient.GetOddsAsync(query.Sport, markets, bookmakers);
             if (currentEvents is null || currentEvents.Count == 0)
             {
-                _logger.LogWarning("No odds data returned from The Odds API");
+                logger.LogWarning("No odds data returned from The Odds API");
                 return [];
             }
 
-            _logger.LogInformation("Received odds for {Count} games", currentEvents.Count);
-
-            // Step 2: Find the matching game
-            OddsEvent? matchingEvent;
-
-            if (!string.IsNullOrEmpty(query.AwayTeam))
+            // Find game where player's team is playing
+            OddsEvent? matchingEvent = null;
+            if (!string.IsNullOrEmpty(query.Team))
             {
-                // Both teams specified - find game with both teams
                 matchingEvent = currentEvents.FirstOrDefault(e =>
-                    (TeamNameEquals(e.HomeTeam, query.HomeTeam) && TeamNameEquals(e.AwayTeam, query.AwayTeam)) ||
-                    (TeamNameEquals(e.HomeTeam, query.AwayTeam) && TeamNameEquals(e.AwayTeam, query.HomeTeam)));
-            }
-            else
-            {
-                // Single team - find game where that team is playing (home or away)
-                matchingEvent = currentEvents.FirstOrDefault(e =>
-                    TeamNameEquals(e.HomeTeam, query.HomeTeam) || TeamNameEquals(e.AwayTeam, query.HomeTeam));
+                    TeamNameEquals(e.HomeTeam, query.Team) || TeamNameEquals(e.AwayTeam, query.Team));
             }
 
             if (matchingEvent is null)
             {
-                _logger.LogWarning("No matching game found for query HomeTeam='{Home}', AwayTeam='{Away}'",
+                logger.LogWarning("No matching game found for player {Player}", query.PlayerName);
+                return [];
+            }
+
+            var snapshots = await GetSnapshotsAsync(matchingEvent, query, bookmakers, markets);
+            var normalized = NormalizePlayerSnapshots(snapshots, query);
+
+            return normalized is not null ? [normalized] : [];
+        }
+
+        private async Task<List<OddsBase>> GetGameOddsAsync(GameOddsQuery query, SubscriptionTier userTier)
+        {
+            var market = query.MarketDefinition;
+            var accessibleBookmakers = await marketRepository.GetAccessibleBookmakersAsync(userTier);
+            var markets = new[] { market.Key };
+            var bookmakers = accessibleBookmakers.Select(x => x.Key).ToArray();
+
+            logger.LogInformation(
+                "Fetching odds for HomeTeam: {HomeTeam}, AwayTeam: {AwayTeam}, Market: {Market}, Sport: {Sport}, Tier: {Tier}",
+                query.HomeTeam, query.AwayTeam ?? "any", market.Key, query.Sport, userTier);
+
+            var currentEvents = await oddsClient.GetOddsAsync(query.Sport, markets, bookmakers);
+            if (currentEvents is null || currentEvents.Count == 0)
+            {
+                logger.LogWarning("No odds data returned from The Odds API");
+                return [];
+            }
+
+            OddsEvent? matchingEvent = !string.IsNullOrEmpty(query.AwayTeam)
+                ? currentEvents.FirstOrDefault(e =>
+                    (TeamNameEquals(e.HomeTeam, query.HomeTeam) && TeamNameEquals(e.AwayTeam, query.AwayTeam)) ||
+                    (TeamNameEquals(e.HomeTeam, query.AwayTeam) && TeamNameEquals(e.AwayTeam, query.HomeTeam)))
+                : currentEvents.FirstOrDefault(e =>
+                    TeamNameEquals(e.HomeTeam, query.HomeTeam) || TeamNameEquals(e.AwayTeam, query.HomeTeam));
+
+            if (matchingEvent is null)
+            {
+                logger.LogWarning("No matching game found for HomeTeam='{Home}', AwayTeam='{Away}'",
                     query.HomeTeam, query.AwayTeam ?? "null");
                 return [];
             }
 
-            _logger.LogInformation("Matched game: {Away} @ {Home} (ID: {Id})",
+            logger.LogInformation("Matched game: {Away} @ {Home} (ID: {Id})",
                 matchingEvent.AwayTeam, matchingEvent.HomeTeam, matchingEvent.Id);
 
-            // Step 3: Get line movement history if days > 0
-            List<OddsSnapshot> snapshots;
+            var snapshots = await GetSnapshotsAsync(matchingEvent, query, bookmakers, markets);
+            var normalized = NormalizeGameSnapshots(snapshots, query);
+
+            return [normalized];
+        }
+
+        private async Task<List<OddsSnapshot>> GetSnapshotsAsync(
+            OddsEvent matchingEvent,
+            OddsQueryBase query,
+            string[] bookmakers,
+            string[] markets)
+        {
             if (query.DaysBack > 0)
             {
-                _logger.LogInformation("Fetching line movement for {Days} days back", query.DaysBack);
-
+                logger.LogInformation("Fetching line movement for {Days} days back", query.DaysBack);
                 var intervalsPerDay = query.DaysBack <= 1 ? 8 : (query.DaysBack <= 3 ? 4 : 2);
 
-                snapshots = await _oddsClient.GetLineMovementAsync(
+                return await oddsClient.GetLineMovementAsync(
+                    query.Sport,
                     matchingEvent.Id,
                     query.DaysBack,
                     intervalsPerDay,
                     markets,
-                    accessibleBookmakers);
-
-                _logger.LogInformation("Retrieved {Count} historical snapshots", snapshots.Count);
-            }
-            else
-            {
-                snapshots = [new OddsSnapshot(DateTime.UtcNow, matchingEvent)];
+                    bookmakers
+                    );
             }
 
-            // Step 4: Normalize all snapshots into our format
-            var normalized = NormalizeSnapshots(snapshots, query.MarketType, query.PlayerName);
-
-            return [normalized];
+            return [new OddsSnapshot(DateTime.UtcNow, matchingEvent)];
         }
 
         private static bool TeamNameEquals(string? apiTeamName, string? queryTeamName)
@@ -144,202 +158,227 @@ namespace OddsTracker.Core.Services
             return api == query || api.Contains(query) || query.Contains(api);
         }
 
-        private static NormalizedOdds NormalizeSnapshots(
-            List<OddsSnapshot> snapshots,
-            MarketType marketType,
-            string? playerName = null)
+        private GameOdds NormalizeGameSnapshots(List<OddsSnapshot> snapshots, OddsQueryBase query)
         {
+            var market = query.MarketDefinition;
+
             if (snapshots.Count == 0)
             {
-                return new NormalizedOdds();
+                return new GameOdds
+                {
+                    MarketDefinition = market
+                };
             }
 
             var firstEvent = snapshots[0].Event;
-            var allBookSnapshots = new List<BookSnapshot>();
+            var bookSnapshots = ExtractGameBookSnapshots(snapshots, market);
 
-            foreach (var snapshot in snapshots)
-            {
-                var evt = snapshot.Event;
-                var timestamp = snapshot.Timestamp;
-
-                foreach (var bookmaker in evt.Bookmakers ?? [])
-                {
-                    // For player props, we may get multiple players - create a snapshot for each
-                    if (marketType.IsPlayerProp() && string.IsNullOrEmpty(playerName))
-                    {
-                        var market = bookmaker.Markets?.FirstOrDefault(m => m.Key == marketType.ToApiKey());
-                        if (market?.Outcomes is not null)
-                        {
-                            // Get unique player names
-                            var players = market.Outcomes
-                                .Where(o => o.Name == "Over" && !string.IsNullOrEmpty(o.Description))
-                                .Select(o => o.Description!)
-                                .Distinct();
-
-                            foreach (var player in players)
-                            {
-                                var bookSnapshot = CreateSnapshot(evt, bookmaker, marketType, timestamp, player);
-                                if (bookSnapshot is not null)
-                                {
-                                    allBookSnapshots.Add(bookSnapshot);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        var bookSnapshot = CreateSnapshot(evt, bookmaker, marketType, timestamp, playerName);
-                        if (bookSnapshot is not null)
-                        {
-                            allBookSnapshots.Add(bookSnapshot);
-                        }
-                    }
-                }
-            }
-
-            return new NormalizedOdds
+            return new GameOdds
             {
                 EventId = firstEvent.Id ?? string.Empty,
                 HomeTeam = firstEvent.HomeTeam ?? string.Empty,
                 AwayTeam = firstEvent.AwayTeam ?? string.Empty,
                 CommenceTime = firstEvent.CommenceTime,
-                MarketType = marketType,
-                PlayerName = playerName,
-                Snapshots = allBookSnapshots
+                MarketDefinition = market,
+                Snapshots = [.. bookSnapshots.Cast<BookSnapshotBase>()]
             };
         }
 
-        private static BookSnapshot? CreateSnapshot(
+        private PlayerOdds? NormalizePlayerSnapshots(List<OddsSnapshot> snapshots, PlayerOddsQuery query)
+        {
+            var market = query.MarketDefinition;
+
+            if (snapshots.Count == 0)
+                return null;
+
+            var firstEvent = snapshots[0].Event;
+            var bookSnapshots = ExtractPlayerBookSnapshots(snapshots, market, query.PlayerName);
+
+            if (bookSnapshots.Count == 0)
+                return null;
+
+            var isHome = TeamNameEquals(firstEvent.HomeTeam, query.Team);
+
+            return new PlayerOdds
+            {
+                EventId = firstEvent.Id ?? string.Empty,
+                PlayerName = query.PlayerName,
+                Team = query.Team ?? string.Empty,
+                Opponent = isHome ? firstEvent.AwayTeam : firstEvent.HomeTeam,
+                CommenceTime = firstEvent.CommenceTime,
+                MarketDefinition = market,
+                Snapshots = [.. bookSnapshots.Cast<BookSnapshotBase>()]
+            };
+        }
+
+        private List<GameBookSnapshot> ExtractGameBookSnapshots(
+            List<OddsSnapshot> snapshots,
+            MarketDefinition market)
+        {
+            var allBookSnapshots = new List<GameBookSnapshot>();
+
+            foreach (var snapshot in snapshots)
+            {
+                foreach (var bookmaker in snapshot.Event.Bookmakers ?? [])
+                {
+                    var bookSnapshot = CreateGameSnapshot(snapshot.Event, bookmaker, market, snapshot.Timestamp);
+                    if (bookSnapshot is not null)
+                    {
+                        allBookSnapshots.Add(bookSnapshot);
+                    }
+                }
+            }
+
+            return allBookSnapshots;
+        }
+
+        private List<PlayerBookSnapshot> ExtractPlayerBookSnapshots(
+            List<OddsSnapshot> snapshots,
+            MarketDefinition market,
+            string playerName)
+        {
+            var allBookSnapshots = new List<PlayerBookSnapshot>();
+
+            foreach (var snapshot in snapshots)
+            {
+                foreach (var bookmaker in snapshot.Event.Bookmakers ?? [])
+                {
+                    var bookSnapshot = CreatePlayerSnapshot(bookmaker, market, snapshot.Timestamp, playerName);
+                    if (bookSnapshot is not null)
+                    {
+                        allBookSnapshots.Add(bookSnapshot);
+                    }
+                }
+            }
+
+            return allBookSnapshots;
+        }
+
+        /// <summary>
+        /// Creates a game book snapshot based on market definition.
+        /// Handles spreads, totals, and moneylines with appropriate outcome matching.
+        /// </summary>
+        private GameBookSnapshot? CreateGameSnapshot(
             OddsEvent evt,
             Bookmaker bookmaker,
-            MarketType marketType,
-            DateTime timestamp,
-            string? playerName = null)
+            MarketDefinition market,
+            DateTime timestamp)
         {
-            var marketKey = marketType.ToApiKey();
-            var market = bookmaker.Markets?.FirstOrDefault(m => m.Key == marketKey);
-            if (market is null) return null;
+            var apiMarket = bookmaker.Markets?.FirstOrDefault(m =>
+                m.Key.Equals(market.Key, StringComparison.OrdinalIgnoreCase));
 
-            // Handle player props
-            if (marketType.IsPlayerProp())
+            if (apiMarket?.Outcomes is null || apiMarket.Outcomes.Count == 0)
+                return null;
+
+            // Determine outcome names based on market outcome type
+            var (primaryName, secondaryName, usePoint) = GetOutcomeConfig(market, evt);
+
+            var primaryOutcome = apiMarket.Outcomes.FirstOrDefault(o => o.Name == primaryName);
+            var secondaryOutcome = apiMarket.Outcomes.FirstOrDefault(o => o.Name == secondaryName);
+
+            if (primaryOutcome is null)
+                return null;
+
+            var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key);
+
+            return new GameBookSnapshot
             {
-                return CreatePlayerPropSnapshot(bookmaker, market, timestamp, playerName);
-            }
-
-            // Handle game lines
-            return marketType switch
-            {
-                MarketType.Spread or MarketType.SpreadH1 or MarketType.SpreadH2 or
-                MarketType.SpreadQ2 or MarketType.SpreadQ3 or MarketType.SpreadQ4 or
-                MarketType.AlternateSpread
-                    => CreateSpreadSnapshot(evt, bookmaker, market, timestamp),
-
-                MarketType.Total or MarketType.TotalH1 or MarketType.TotalH2 or
-                MarketType.TotalQ2 or MarketType.TotalQ3 or MarketType.TotalQ4 or
-                MarketType.AlternateTotal or MarketType.TeamTotal or MarketType.AlternateTeamTotal
-                    => CreateTotalSnapshot(bookmaker, market, timestamp),
-
-                MarketType.Moneyline or MarketType.MoneylineH1 or MarketType.MoneylineH2 or
-                MarketType.MoneylineQ2 or MarketType.MoneylineQ3 or MarketType.MoneylineQ4 or
-                MarketType.ThreeWayH1
-                    => CreateMoneylineSnapshot(evt, bookmaker, market, timestamp),
-
-                _ => null
+                BookmakerName = bookmaker.Title ?? bookmaker.Key ?? "Unknown",
+                BookmakerKey = bookmaker.Key ?? "unknown",
+                BookType = bookmakerTier,
+                Timestamp = timestamp,
+                Line = usePoint ? (primaryOutcome.Point ?? 0) : 0,
+                HomeOdds = primaryOutcome.Price,
+                AwayOdds = secondaryOutcome?.Price
             };
         }
 
-        private static BookSnapshot? CreatePlayerPropSnapshot(
-            Bookmaker bookmaker,
-            Market market,
-            DateTime timestamp,
-            string? playerName = null)
+        /// <summary>
+        /// Gets the outcome configuration for a market definition.
+        /// Returns (primaryOutcomeName, secondaryOutcomeName, usePointAsLine)
+        /// </summary>
+        private static (string Primary, string Secondary, bool UsePoint) GetOutcomeConfig(
+            MarketDefinition market,
+            OddsEvent evt)
         {
-            // If player name specified, filter by that player
-            var outcomes = market.Outcomes ?? [];
-
-            if (!string.IsNullOrEmpty(playerName))
+            return market.OutcomeType switch
             {
-                outcomes = outcomes
-                    .Where(o => o.Description?.Contains(playerName, StringComparison.OrdinalIgnoreCase) == true)
-                    .ToList();
-            }
+                // Over/Under markets - totals, player props
+                OutcomeType.OverUnder => ("Over", "Under", true),
 
-            // Get Over/Under for the player
-            var overOutcome = outcomes.FirstOrDefault(o => o.Name == "Over");
-            var underOutcome = outcomes.FirstOrDefault(o =>
+                // Team-based markets
+                OutcomeType.TeamBased => market.Key.Contains("h2h") || market.Key.Contains("moneyline")
+                    ? (evt.HomeTeam, evt.AwayTeam, false)  // Moneyline - no point
+                    : (evt.HomeTeam, evt.AwayTeam, true),   // Spreads - use point
+
+                // Yes/No markets
+                OutcomeType.YesNo => ("Yes", "No", false),
+
+                // Named outcome markets (draw, etc.)
+                OutcomeType.Named => (evt.HomeTeam, evt.AwayTeam, false),
+
+                // Default to team-based with point
+                _ => (evt.HomeTeam, evt.AwayTeam, true)
+            };
+        }
+
+        private PlayerBookSnapshot? CreatePlayerSnapshot(
+            Bookmaker bookmaker,
+            MarketDefinition market,
+            DateTime timestamp,
+            string playerName)
+        {
+            var apiMarket = bookmaker.Markets?.FirstOrDefault(m =>
+                m.Key.Equals(market.Key, StringComparison.OrdinalIgnoreCase));
+
+            if (apiMarket?.Outcomes is null || apiMarket.Outcomes.Count == 0)
+                return null;
+
+            var playerOutcomes = apiMarket.Outcomes
+                .Where(o => o.Description?.Contains(playerName, StringComparison.OrdinalIgnoreCase) == true)
+                .ToList();
+
+            var overOutcome = playerOutcomes.FirstOrDefault(o => o.Name == "Over");
+            var underOutcome = playerOutcomes.FirstOrDefault(o =>
                 o.Name == "Under" && o.Description == overOutcome?.Description);
 
-            if (overOutcome is null) return null;
+            var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key);
 
-            return new BookSnapshot
+            // For Yes/No props (like anytime TD), look for different outcome names
+            if (overOutcome is null && market.OutcomeType == OutcomeType.YesNo)
+            {
+                var yesOutcome = playerOutcomes.FirstOrDefault(o => o.Name == "Yes");
+                if (yesOutcome is not null)
+                {
+                    return new PlayerBookSnapshot
+                    {
+                        BookmakerName = bookmaker.Title ?? bookmaker.Key ?? "Unknown",
+                        BookmakerKey = bookmaker.Key ?? "unknown",
+                        BookType = bookmakerTier,
+                        Timestamp = timestamp,
+                        Line = yesOutcome.Point ?? 0,
+                        OverOdds = yesOutcome.Price,
+                        UnderOdds = playerOutcomes.FirstOrDefault(o => o.Name == "No")?.Price,
+                        PlayerName = yesOutcome.Description ?? playerName,
+                        PropType = market.DisplayName
+                    };
+                }
+            }
+
+            if (overOutcome is null)
+                return null;
+
+            return new PlayerBookSnapshot
             {
                 BookmakerName = bookmaker.Title ?? bookmaker.Key ?? "Unknown",
                 BookmakerKey = bookmaker.Key ?? "unknown",
+                BookType = bookmakerTier,
                 Timestamp = timestamp,
                 Line = overOutcome.Point ?? 0,
-                HomeOdds = overOutcome.Price,  // Over odds
-                AwayOdds = underOutcome?.Price, // Under odds
-                PlayerName = overOutcome.Description,
-                OutcomeName = "Over/Under"
-            };
-        }
-
-        private static string GetMarketKey(MarketType marketType) => marketType.ToApiKey();
-
-        private static BookSnapshot? CreateSpreadSnapshot(
-            OddsEvent evt, Bookmaker bookmaker, Market market, DateTime timestamp)
-        {
-            var homeOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.HomeTeam);
-            var awayOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.AwayTeam);
-
-            if (homeOutcome is null) return null;
-
-            return new BookSnapshot
-            {
-                BookmakerName = bookmaker.Title ?? bookmaker.Key ?? "Unknown",
-                BookmakerKey = bookmaker.Key ?? "unknown",
-                Timestamp = timestamp,
-                Line = homeOutcome.Point ?? 0,
-                HomeOdds = homeOutcome.Price,
-                AwayOdds = awayOutcome?.Price
-            };
-        }
-
-        private static BookSnapshot? CreateTotalSnapshot(
-            Bookmaker bookmaker, Market market, DateTime timestamp)
-        {
-            var overOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == "Over");
-            var underOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == "Under");
-
-            if (overOutcome is null) return null;
-
-            return new BookSnapshot
-            {
-                BookmakerName = bookmaker.Title ?? bookmaker.Key ?? "Unknown",
-                BookmakerKey = bookmaker.Key ?? "unknown",
-                Timestamp = timestamp,
-                Line = overOutcome.Point ?? 0,
-                HomeOdds = overOutcome.Price,
-                AwayOdds = underOutcome?.Price
-            };
-        }
-
-        private static BookSnapshot? CreateMoneylineSnapshot(
-            OddsEvent evt, Bookmaker bookmaker, Market market, DateTime timestamp)
-        {
-            var homeOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.HomeTeam);
-            var awayOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.AwayTeam);
-
-            if (homeOutcome is null) return null;
-
-            return new BookSnapshot
-            {
-                BookmakerName = bookmaker.Title ?? bookmaker.Key ?? "Unknown",
-                BookmakerKey = bookmaker.Key ?? "unknown",
-                Timestamp = timestamp,
-                Line = 0,
-                HomeOdds = homeOutcome.Price,
-                AwayOdds = awayOutcome?.Price
+                OverOdds = overOutcome.Price,
+                UnderOdds = underOutcome?.Price,
+                PlayerName = overOutcome.Description ?? playerName,
+                PropType = market.DisplayName
             };
         }
     }
