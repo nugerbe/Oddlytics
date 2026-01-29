@@ -1,4 +1,5 @@
 ﻿using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OddsTracker.Core.Interfaces;
 using OddsTracker.Core.Models;
@@ -12,7 +13,7 @@ namespace OddsTracker.Functions.Functions
     /// </summary>
     public class OddsPollerFunction(
         IOddsApiClient oddsClient,
-        IMarketRepository marketRepository,
+        IServiceScopeFactory scopeFactory,
         IMovementFingerprintService fingerprintService,
         IConfidenceScoringEngine confidenceEngine,
         IAlertEngine alertEngine,
@@ -24,16 +25,15 @@ namespace OddsTracker.Functions.Functions
         private static readonly TimeSpan ClosingLineCacheWindow = TimeSpan.FromMinutes(5);
         private static readonly TimeSpan ClosingLineCacheDuration = TimeSpan.FromHours(8);
 
-        // Player props polling frequency - every 5th run (5 minutes)
         private static int _pollCounter = 0;
         private const int PlayerPropPollInterval = 5;
 
-        /// <summary>
-        /// Timer trigger: runs every 60 seconds
-        /// CRON: "0 * * * * *" = every minute at second 0
-        /// </summary>
         [Function("OddsPoller")]
+#if DEBUG
+        public async Task Run([TimerTrigger("0 * * * * *", RunOnStartup = true)] MyTimerInfo timerInfo)
+#else
         public async Task Run([TimerTrigger("0 * * * * *")] MyTimerInfo timerInfo)
+#endif
         {
             logger.LogInformation("OddsPoller function triggered at {Time}", DateTime.UtcNow);
 
@@ -48,9 +48,11 @@ namespace OddsTracker.Functions.Functions
             var alertsSent = 0;
             var shouldPollPlayerProps = _pollCounter % PlayerPropPollInterval == 0;
 
-            // Get active sports from database
-            var sports = await marketRepository.GetAllSportsAsync();
-            var activeSports = sports.Where(s => s.IsActive).ToList();
+            // Get active sports (cached)
+            var activeSports = await GetActiveSportsAsync();
+
+            // Pre-fetch bookmaker tiers once for the entire run
+            var bookmakerTiers = await GetBookmakerTiersAsync();
 
             logger.LogDebug("Polling {Count} active sports (PlayerProps: {PlayerProps})",
                 activeSports.Count, shouldPollPlayerProps);
@@ -59,19 +61,16 @@ namespace OddsTracker.Functions.Functions
             {
                 try
                 {
-                    // Get all markets available for this sport
-                    var allMarkets = await marketRepository.GetMarketsForSportAsync(sport.Key);
+                    var allMarkets = await GetMarketsForSportAsync(sport.Key);
                     var marketsByKey = allMarkets.ToDictionary(m => m.Key, StringComparer.OrdinalIgnoreCase);
 
-                    // Poll game markets (spreads, totals, moneylines)
-                    var (gameEvents, gameAlerts) = await PollGameMarketsAsync(sport, allMarkets, marketsByKey);
+                    var (gameEvents, gameAlerts) = await PollGameMarketsAsync(sport, allMarkets, marketsByKey, bookmakerTiers);
                     totalEvents += gameEvents;
                     alertsSent += gameAlerts;
 
-                    // Poll player props less frequently
                     if (shouldPollPlayerProps)
                     {
-                        var (propEvents, propAlerts) = await PollPlayerPropsAsync(sport, allMarkets, marketsByKey);
+                        var (propEvents, propAlerts) = await PollPlayerPropsAsync(sport, allMarkets, marketsByKey, bookmakerTiers);
                         totalEvents += propEvents;
                         alertsSent += propAlerts;
                     }
@@ -90,9 +89,9 @@ namespace OddsTracker.Functions.Functions
         private async Task<(int events, int alerts)> PollGameMarketsAsync(
             Sport sport,
             IReadOnlyList<MarketDefinition> allMarkets,
-            Dictionary<string, MarketDefinition> marketsByKey)
+            Dictionary<string, MarketDefinition> marketsByKey,
+            Dictionary<string, BookmakerTier> bookmakerTiers)
         {
-            // Filter to game-level markets (non-player props, non-alternates)
             var gameMarkets = allMarkets
                 .Where(m => !m.IsPlayerProp && !m.IsAlternate)
                 .Select(m => m.Key)
@@ -126,7 +125,7 @@ namespace OddsTracker.Functions.Functions
 
                     try
                     {
-                        var sent = await ProcessGameMarketAsync(evt, market);
+                        var sent = await ProcessGameMarketAsync(evt, market, bookmakerTiers);
                         if (sent) alertsSent++;
                     }
                     catch (Exception ex)
@@ -142,9 +141,9 @@ namespace OddsTracker.Functions.Functions
         private async Task<(int events, int alerts)> PollPlayerPropsAsync(
             Sport sport,
             IReadOnlyList<MarketDefinition> allMarkets,
-            Dictionary<string, MarketDefinition> marketsByKey)
+            Dictionary<string, MarketDefinition> marketsByKey,
+            Dictionary<string, BookmakerTier> bookmakerTiers)
         {
-            // Filter to player prop markets (non-alternates)
             var propMarkets = allMarkets
                 .Where(m => m.IsPlayerProp && !m.IsAlternate)
                 .Select(m => m.Key)
@@ -159,7 +158,6 @@ namespace OddsTracker.Functions.Functions
             logger.LogDebug("Polling {Sport} for player prop markets: {Count} markets",
                 sport.Key, propMarkets.Length);
 
-            // First get events to know which games have props available
             var events = await oddsClient.GetEventsAsync(sport.Key);
 
             if (events is null || events.Count == 0)
@@ -170,8 +168,6 @@ namespace OddsTracker.Functions.Functions
             var alertsSent = 0;
             var eventsProcessed = 0;
 
-            // For player props, we need to fetch per-event odds
-            // Limit to upcoming games (next 24 hours) to conserve API calls
             var upcomingEvents = events
                 .Where(e => e.CommenceTime > DateTime.UtcNow && e.CommenceTime < DateTime.UtcNow.AddHours(24))
                 .ToList();
@@ -180,7 +176,6 @@ namespace OddsTracker.Functions.Functions
             {
                 try
                 {
-                    // Get player prop odds for this event
                     var eventOdds = await oddsClient.GetEventOddsAsync(evt.Id, sport.Key, propMarkets);
 
                     if (eventOdds?.Bookmakers is null || eventOdds.Bookmakers.Count == 0)
@@ -188,7 +183,6 @@ namespace OddsTracker.Functions.Functions
 
                     eventsProcessed++;
 
-                    // Process each player prop market
                     foreach (var marketKey in propMarkets)
                     {
                         if (!marketsByKey.TryGetValue(marketKey, out var market))
@@ -196,7 +190,7 @@ namespace OddsTracker.Functions.Functions
 
                         try
                         {
-                            var sent = await ProcessPlayerPropMarketAsync(eventOdds, market);
+                            var sent = await ProcessPlayerPropMarketAsync(eventOdds, market, bookmakerTiers);
                             if (sent) alertsSent++;
                         }
                         catch (Exception ex)
@@ -215,16 +209,16 @@ namespace OddsTracker.Functions.Functions
             return (eventsProcessed, alertsSent);
         }
 
-        private async Task<bool> ProcessGameMarketAsync(OddsEvent evt, MarketDefinition market)
+        private async Task<bool> ProcessGameMarketAsync(
+            OddsEvent evt,
+            MarketDefinition market,
+            Dictionary<string, BookmakerTier> bookmakerTiers)
         {
-            // Extract book snapshots from event
-            var bookSnapshots = ExtractGameBookSnapshots(evt, market);
+            var bookSnapshots = ExtractGameBookSnapshots(evt, market, bookmakerTiers);
             if (bookSnapshots.Count == 0) return false;
 
-            // Get previous fingerprint from cache
             var previousFingerprint = await fingerprintService.GetPreviousFingerprintAsync(evt.Id, market.Key);
 
-            // Create new fingerprint
             var fingerprint = await fingerprintService.CreateFingerprintAsync(
                 evt.Id,
                 market,
@@ -233,13 +227,9 @@ namespace OddsTracker.Functions.Functions
                 evt.AwayTeam,
                 evt.CommenceTime);
 
-            // Save fingerprint to cache
             await fingerprintService.SaveFingerprintAsync(fingerprint);
-
-            // Store closing line if game is about to start
             await TryStoreClosingLineAsync(evt, fingerprint);
 
-            // Check for material change
             if (!fingerprintService.HasMaterialChange(fingerprint, previousFingerprint))
             {
                 logger.LogDebug("No material change for {EventId}:{MarketKey}", evt.Id, market.Key);
@@ -249,13 +239,14 @@ namespace OddsTracker.Functions.Functions
             return await ProcessAlertAsync(fingerprint);
         }
 
-        private async Task<bool> ProcessPlayerPropMarketAsync(OddsEvent evt, MarketDefinition market)
+        private async Task<bool> ProcessPlayerPropMarketAsync(
+            OddsEvent evt,
+            MarketDefinition market,
+            Dictionary<string, BookmakerTier> bookmakerTiers)
         {
-            // Extract player book snapshots from event
-            var bookSnapshots = ExtractPlayerBookSnapshots(evt, market);
+            var bookSnapshots = ExtractPlayerBookSnapshots(evt, market, bookmakerTiers);
             if (bookSnapshots.Count == 0) return false;
 
-            // Group by player (each player is essentially a separate market)
             var playerGroups = bookSnapshots
                 .GroupBy(s => s.PlayerName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -267,14 +258,11 @@ namespace OddsTracker.Functions.Functions
                 var playerName = playerGroup.Key;
                 var playerSnapshots = playerGroup.ToList();
 
-                // Use player name in the cache key to differentiate
                 var marketCacheKey = $"{market.Key}:{playerName.ToLowerInvariant().Replace(" ", "_")}";
 
-                // Get previous fingerprint for this player
                 var previousFingerprint = await fingerprintService.GetPreviousFingerprintAsync(
                     evt.Id, marketCacheKey);
 
-                // Create fingerprint for this player's prop
                 var fingerprint = await fingerprintService.CreateFingerprintAsync(
                     evt.Id,
                     market,
@@ -282,9 +270,6 @@ namespace OddsTracker.Functions.Functions
                     evt.HomeTeam,
                     evt.AwayTeam,
                     evt.CommenceTime);
-
-                // Override the market key to include player
-                // Note: This requires MarketKey to be settable or using a different approach
 
                 await fingerprintService.SaveFingerprintAsync(fingerprint);
 
@@ -300,20 +285,15 @@ namespace OddsTracker.Functions.Functions
 
         private async Task<bool> ProcessAlertAsync(MarketFingerprint fingerprint)
         {
-            // Calculate confidence score
             var confidence = confidenceEngine.CalculateScore(fingerprint);
 
-            // Record signal for historical tracking
             await historicalTracker.RecordSignalAsync(fingerprint, confidence);
 
-            // Evaluate for alert
             var alert = await alertEngine.EvaluateForAlertAsync(fingerprint, confidence);
             if (alert is null) return false;
 
-            // Check if we should send (deduplication, cooldown, etc.)
             if (!await alertEngine.ShouldSendAlertAsync(alert)) return false;
 
-            // Send alert via Discord
             await discordService.SendAlertAsync(alert);
             await alertEngine.MarkAlertSentAsync(alert);
 
@@ -329,7 +309,10 @@ namespace OddsTracker.Functions.Functions
 
         #region Snapshot Extraction
 
-        private List<GameBookSnapshot> ExtractGameBookSnapshots(OddsEvent evt, MarketDefinition market)
+        private List<GameBookSnapshot> ExtractGameBookSnapshots(
+            OddsEvent evt,
+            MarketDefinition market,
+            Dictionary<string, BookmakerTier> bookmakerTiers)
         {
             var snapshots = new List<GameBookSnapshot>();
 
@@ -340,7 +323,7 @@ namespace OddsTracker.Functions.Functions
 
                 if (apiMarket is null) continue;
 
-                var snapshot = CreateGameSnapshot(evt, bookmaker, apiMarket, market);
+                var snapshot = CreateGameSnapshot(evt, bookmaker, apiMarket, market, bookmakerTiers);
                 if (snapshot is not null)
                 {
                     snapshots.Add(snapshot);
@@ -350,20 +333,24 @@ namespace OddsTracker.Functions.Functions
             return snapshots;
         }
 
-        private List<PlayerBookSnapshot> ExtractPlayerBookSnapshots(OddsEvent evt, MarketDefinition market)
+        private List<PlayerBookSnapshot> ExtractPlayerBookSnapshots(
+            OddsEvent evt,
+            MarketDefinition market,
+            Dictionary<string, BookmakerTier> bookmakerTiers)
         {
             var snapshots = new List<PlayerBookSnapshot>();
 
             foreach (var bookmaker in evt.Bookmakers ?? [])
             {
-                var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key ?? "");
+                var bookmakerTier = bookmakerTiers.TryGetValue(bookmaker.Key ?? "", out var tier)
+                    ? tier
+                    : BookmakerTier.Retail;
 
                 var apiMarket = bookmaker.Markets?.FirstOrDefault(m =>
                     m.Key.Equals(market.Key, StringComparison.OrdinalIgnoreCase));
 
                 if (apiMarket?.Outcomes is null) continue;
 
-                // Player props have outcomes with description containing player name
                 var playerOutcomes = apiMarket.Outcomes
                     .Where(o => !string.IsNullOrEmpty(o.Description))
                     .GroupBy(o => o.Description!, StringComparer.OrdinalIgnoreCase)
@@ -374,7 +361,6 @@ namespace OddsTracker.Functions.Functions
                     var overOutcome = playerGroup.FirstOrDefault(o => o.Name == "Over");
                     var underOutcome = playerGroup.FirstOrDefault(o => o.Name == "Under");
 
-                    // For Yes/No props
                     if (overOutcome is null && market.OutcomeType == OutcomeType.YesNo)
                     {
                         var yesOutcome = playerGroup.FirstOrDefault(o => o.Name == "Yes");
@@ -416,39 +402,46 @@ namespace OddsTracker.Functions.Functions
             return snapshots;
         }
 
-        private GameBookSnapshot? CreateGameSnapshot(
+        private static GameBookSnapshot? CreateGameSnapshot(
             OddsEvent evt,
             Bookmaker bookmaker,
             Market apiMarket,
-            MarketDefinition market)
+            MarketDefinition market,
+            Dictionary<string, BookmakerTier> bookmakerTiers)
         {
+            var bookmakerTier = bookmakerTiers.TryGetValue(bookmaker.Key ?? "", out var tier)
+                ? tier
+                : BookmakerTier.Retail;
+
             return market.OutcomeType switch
             {
                 OutcomeType.TeamBased when market.Key.Contains("spread", StringComparison.OrdinalIgnoreCase)
-                    => CreateSpreadSnapshot(evt, bookmaker, apiMarket),
+                    => CreateSpreadSnapshot(evt, bookmaker, apiMarket, bookmakerTier),
 
                 OutcomeType.OverUnder
-                    => CreateTotalSnapshot(bookmaker, apiMarket),
+                    => CreateTotalSnapshot(bookmaker, apiMarket, bookmakerTier),
 
                 OutcomeType.TeamBased
-                    => CreateMoneylineSnapshot(evt, bookmaker, apiMarket),
+                    => CreateMoneylineSnapshot(evt, bookmaker, apiMarket, bookmakerTier),
 
                 OutcomeType.YesNo
-                    => CreateYesNoSnapshot(bookmaker, apiMarket),
+                    => CreateYesNoSnapshot(bookmaker, apiMarket, bookmakerTier),
 
                 OutcomeType.Named
-                    => CreateNamedSnapshot(evt, bookmaker, apiMarket),
+                    => CreateNamedSnapshot(evt, bookmaker, apiMarket, bookmakerTier),
 
                 _ => null
             };
         }
 
-        private GameBookSnapshot? CreateSpreadSnapshot(OddsEvent evt, Bookmaker bookmaker, Market market)
+        private static GameBookSnapshot? CreateSpreadSnapshot(
+            OddsEvent evt,
+            Bookmaker bookmaker,
+            Market market,
+            BookmakerTier bookmakerTier)
         {
             var homeOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.HomeTeam);
             if (homeOutcome is null) return null;
-
-            var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key ?? "");
 
             return new GameBookSnapshot
             {
@@ -462,12 +455,13 @@ namespace OddsTracker.Functions.Functions
             };
         }
 
-        private GameBookSnapshot? CreateTotalSnapshot(Bookmaker bookmaker, Market market)
+        private static GameBookSnapshot? CreateTotalSnapshot(
+            Bookmaker bookmaker,
+            Market market,
+            BookmakerTier bookmakerTier)
         {
             var overOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == "Over");
             if (overOutcome is null) return null;
-
-            var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key ?? "");
 
             return new GameBookSnapshot
             {
@@ -481,14 +475,16 @@ namespace OddsTracker.Functions.Functions
             };
         }
 
-        private GameBookSnapshot? CreateMoneylineSnapshot(OddsEvent evt, Bookmaker bookmaker, Market market)
+        private static GameBookSnapshot? CreateMoneylineSnapshot(
+            OddsEvent evt,
+            Bookmaker bookmaker,
+            Market market,
+            BookmakerTier bookmakerTier)
         {
             var homeOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.HomeTeam);
             var awayOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.AwayTeam);
 
             if (homeOutcome is null) return null;
-
-            var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key ?? "");
 
             return new GameBookSnapshot
             {
@@ -502,12 +498,13 @@ namespace OddsTracker.Functions.Functions
             };
         }
 
-        private GameBookSnapshot? CreateYesNoSnapshot(Bookmaker bookmaker, Market market)
+        private static GameBookSnapshot? CreateYesNoSnapshot(
+            Bookmaker bookmaker,
+            Market market,
+            BookmakerTier bookmakerTier)
         {
             var yesOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == "Yes");
             if (yesOutcome is null) return null;
-
-            var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key ?? "");
 
             return new GameBookSnapshot
             {
@@ -521,14 +518,16 @@ namespace OddsTracker.Functions.Functions
             };
         }
 
-        private GameBookSnapshot? CreateNamedSnapshot(OddsEvent evt, Bookmaker bookmaker, Market market)
+        private static GameBookSnapshot? CreateNamedSnapshot(
+            OddsEvent evt,
+            Bookmaker bookmaker,
+            Market market,
+            BookmakerTier bookmakerTier)
         {
             var homeOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.HomeTeam);
             var awayOutcome = market.Outcomes?.FirstOrDefault(o => o.Name == evt.AwayTeam);
 
             if (homeOutcome is null) return null;
-
-            var bookmakerTier = marketRepository.GetBookmakerTier(bookmaker.Key ?? "");
 
             return new GameBookSnapshot
             {
@@ -541,8 +540,6 @@ namespace OddsTracker.Functions.Functions
                 Timestamp = bookmaker.LastUpdate
             };
         }
-
-        #endregion
 
         private async Task TryStoreClosingLineAsync(OddsEvent evt, MarketFingerprint fingerprint)
         {
@@ -567,5 +564,66 @@ namespace OddsTracker.Functions.Functions
                 }
             }
         }
+
+        #endregion
+
+        #region Cached Repository Access
+        private async Task<List<Sport>> GetActiveSportsAsync()
+        {
+            const string cacheKey = "sports:active";
+
+            var cached = await cache.GetAsync<List<Sport>>(cacheKey);
+            if (cached is not null)
+                return cached;
+
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IMarketRepository>();
+
+            var sports = await repo.GetAllSportsAsync();
+            var active = sports.Where(s => s.IsActive).ToList();
+
+            await cache.SetAsync(cacheKey, active, TimeSpan.FromMinutes(30));
+            return active;
+        }
+
+        private async Task<List<MarketDefinition>> GetMarketsForSportAsync(string sportKey)
+        {
+            var cacheKey = $"markets:sport:{sportKey}";
+
+            var cached = await cache.GetAsync<List<MarketDefinition>>(cacheKey);
+            if (cached is not null)
+                return cached;
+
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IMarketRepository>();
+
+            var markets = await repo.GetMarketsForSportAsync(sportKey);
+
+            await cache.SetAsync(cacheKey, markets, TimeSpan.FromHours(1));
+            return markets;
+        }
+
+        private async Task<Dictionary<string, BookmakerTier>> GetBookmakerTiersAsync()
+        {
+            const string cacheKey = "bookmakers:tiers";
+
+            var cached = await cache.GetAsync<Dictionary<string, BookmakerTier>>(cacheKey);
+            if (cached is not null)
+                return cached;
+
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IMarketRepository>();
+
+            var bookmakers = await repo.GetAllBookmakersAsync();
+            var tiers = bookmakers.ToDictionary(
+                b => b.Key,
+                b => b.Tier,
+                StringComparer.OrdinalIgnoreCase);
+
+            await cache.SetAsync(cacheKey, tiers, TimeSpan.FromHours(1));
+            return tiers;
+        }
+
+        #endregion
     }
 }

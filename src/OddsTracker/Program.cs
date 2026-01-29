@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using OddsTracker;
 using OddsTracker.Core.Clients;
 using OddsTracker.Core.Data;
@@ -114,8 +115,10 @@ if (!string.IsNullOrEmpty(connectionString))
         }
     });
 
+    // Scoped repositories (DbContext-backed)
     builder.Services.AddScoped<IHistoricalRepository, HistoricalRepository>();
     builder.Services.AddScoped<ISubscriptionRepository, SubscriptionRepository>();
+    builder.Services.AddScoped<IMarketRepository, MarketRepository>();
 }
 else
 {
@@ -151,14 +154,23 @@ builder.Services.AddSingleton<EnhancedCacheService>();
 builder.Services.AddSingleton<ICacheService>(sp => sp.GetRequiredService<EnhancedCacheService>());
 builder.Services.AddSingleton<IEnhancedCacheService>(sp => sp.GetRequiredService<EnhancedCacheService>());
 
-// 2. Named HttpClients
+// 2. Cached Market Data Service (centralized repository caching)
+builder.Services.AddSingleton<ICachedMarketDataService>(sp =>
+{
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
+    var logger = sp.GetRequiredService<ILogger<CachedMarketDataService>>();
+    return new CachedMarketDataService(scopeFactory, cacheService, logger);
+});
+
+// 3. Named HttpClients
 builder.Services.AddHttpClient("OddsApi", client =>
 {
     client.DefaultRequestHeaders.Add("Accept", "application/json");
 });
 builder.Services.AddHttpClient("ChartService");
 
-// 4. OddsApiClient (simple - only HttpClient, apiKey, logger)
+// 4. OddsApiClient
 builder.Services.AddSingleton<IOddsApiClient>(sp =>
 {
     var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
@@ -171,7 +183,7 @@ builder.Services.AddSingleton<IOddsApiClient>(sp =>
     return new OddsApiClient(httpClient, apiKey, logger);
 });
 
-// 6. Chart Service
+// 5. Chart Service
 builder.Services.AddSingleton<IChartService>(sp =>
 {
     var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
@@ -180,7 +192,7 @@ builder.Services.AddSingleton<IChartService>(sp =>
     return new QuickChartService(httpClient, logger);
 });
 
-// 7. Anthropic Client
+// 6. Anthropic Client
 builder.Services.AddSingleton(_ =>
 {
     var apiKey = builder.Configuration["AppSettings:ClaudeApiKey"];
@@ -191,25 +203,69 @@ builder.Services.AddSingleton(_ =>
     return new AnthropicClient();
 });
 
-// 8. Sports Data Service
+// 7. Sports Data Service (with sport-specific client factory)
+builder.Services.AddSingleton<ISportClientFactory, OddsTracker.Core.Services.SportClients.SportClientFactory>();
 builder.Services.AddSingleton<ISportsDataService, SportsDataService>();
 
-// 9. OddsService (depends on OddsApiClient, SportsDataService, MarketAccessService)
+// 8. OddsService (uses ICachedMarketDataService)
 builder.Services.AddSingleton<IOddsService>(sp =>
 {
     var oddsClient = sp.GetRequiredService<IOddsApiClient>();
     var sportsDataService = sp.GetRequiredService<ISportsDataService>();
-    var marketRepository = sp.GetRequiredService<IMarketRepository>();
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
     var logger = sp.GetRequiredService<ILogger<OddsService>>();
 
-    return new OddsService(oddsClient, sportsDataService, marketRepository, logger);
+    return new OddsService(oddsClient, sportsDataService, scopeFactory, cacheService, logger);
 });
 
-// 10. Claude and Query parsing services
-builder.Services.AddSingleton<IClaudeService, ClaudeService>();
-builder.Services.AddSingleton<IQueryParser, LocalQueryParser>();
+// 9. Claude Service (uses ICachedMarketDataService)
+builder.Services.AddSingleton<IClaudeService>(sp =>
+{
+    var anthropicClient = sp.GetRequiredService<AnthropicClient>();
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
+    var logger = sp.GetRequiredService<ILogger<ClaudeService>>();
+    return new ClaudeService(anthropicClient, scopeFactory, cacheService, logger);
+});
 
-// 11. Orchestrator
+// 10. Query Parser (uses ICachedMarketDataService)
+builder.Services.AddSingleton<IQueryParser>(sp =>
+{
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
+    var sportsDataService = sp.GetRequiredService<ISportsDataService>();
+    var logger = sp.GetRequiredService<ILogger<QueryParser>>();
+    return new QueryParser(scopeFactory, cacheService, sportsDataService, logger);
+});
+
+// 11. Movement Fingerprint Service (uses ICachedMarketDataService)
+builder.Services.AddSingleton<IMovementFingerprintService>(sp =>
+{
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
+    var marketData = sp.GetRequiredService<ICachedMarketDataService>();
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
+    var logger = sp.GetRequiredService<ILogger<MovementFingerprintService>>();
+    return new MovementFingerprintService(scopeFactory, cacheService, logger);
+});
+
+// 12. Confidence Scoring Engine
+builder.Services.AddSingleton<IConfidenceScoringEngine, ConfidenceScoringEngine>();
+
+// 13. Historical Tracker (uses IServiceScopeFactory for IHistoricalRepository)
+builder.Services.AddSingleton<IHistoricalTracker>(sp =>
+{
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
+    var logger = sp.GetRequiredService<ILogger<HistoricalTracker>>();
+    var options = sp.GetService<IOptions<HistoricalTrackerOptions>>();
+    return new HistoricalTracker(scopeFactory, cacheService, logger, options);
+});
+
+// 14. Alert Engine
+builder.Services.AddSingleton<IAlertEngine, AlertEngine>();
+
+// 15. Orchestrator
 builder.Services.AddSingleton<IOddsOrchestrator>(sp =>
 {
     var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
@@ -218,21 +274,20 @@ builder.Services.AddSingleton<IOddsOrchestrator>(sp =>
     var oddsService = sp.GetRequiredService<IOddsService>();
     var chartService = sp.GetRequiredService<IChartService>();
     var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
-    var marketRepository = sp.GetRequiredService<IMarketRepository>();
     var logger = sp.GetRequiredService<ILogger<OddsOrchestrator>>();
-    return new OddsOrchestrator(scopeFactory, localParser, claudeService, oddsService, chartService, cacheService, marketRepository, logger);
+    return new OddsOrchestrator(scopeFactory, localParser, claudeService, oddsService, chartService, cacheService, logger);
 });
 
-// 12. Alert and tracking services
-builder.Services.AddSingleton<IMovementFingerprintService, MovementFingerprintService>();
-builder.Services.AddSingleton<IConfidenceScoringEngine, ConfidenceScoringEngine>();
-builder.Services.AddSingleton<IAlertEngine, AlertEngine>();
-builder.Services.AddSingleton<IHistoricalTracker, HistoricalTracker>();
+// 16. Subscription Manager
+builder.Services.AddSingleton<ISubscriptionManager>(sp =>
+{
+    var cacheService = sp.GetRequiredService<IEnhancedCacheService>();
+    var scopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
+    var logger = sp.GetRequiredService<ILogger<SubscriptionManager>>();
+    return new SubscriptionManager(cacheService, scopeFactory, logger);
+});
 
-// 13. Subscription services
-builder.Services.AddSingleton<ISubscriptionManager, SubscriptionManager>();
-
-// 14. Discord Bot
+// 17. Discord Bot
 builder.Services.AddSingleton<DiscordBotService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DiscordBotService>());
 
@@ -244,6 +299,10 @@ builder.Services.AddLogging(logging =>
 });
 
 var host = builder.Build();
+
+// Initialize SportClientFactory with sport aliases from database
+var sportClientFactory = host.Services.GetRequiredService<ISportClientFactory>();
+await sportClientFactory.InitializeAsync();
 
 Console.WriteLine("Starting OddsTracker Bot...");
 Console.WriteLine("Press Ctrl+C to stop.");

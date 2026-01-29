@@ -37,6 +37,9 @@ namespace OddsTracker.Core.Interfaces
         Task<RateLimitEntry?> GetRateLimitAsync(ulong userId);
         Task SetRateLimitAsync(RateLimitEntry entry);
 
+        Task<List<SignalSnapshot>?> GetSignalsForEventAsync(string eventId, string marketKey);
+        Task SetSignalsForEventAsync(string eventId, string marketKey, List<SignalSnapshot> signals);
+
         /// <summary>
         /// Invalidate all caches for a specific market
         /// </summary>

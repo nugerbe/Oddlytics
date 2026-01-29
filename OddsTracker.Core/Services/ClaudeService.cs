@@ -1,5 +1,6 @@
 using Anthropic;
 using Anthropic.Models.Messages;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OddsTracker.Core.Interfaces;
 using OddsTracker.Core.Models;
@@ -9,11 +10,12 @@ using System.Text.Json.Serialization;
 
 namespace OddsTracker.Core.Services
 {
-    public class ClaudeService(AnthropicClient client, IMarketRepository marketRepository, ILogger<ClaudeService> logger) : IClaudeService
+    public class ClaudeService(
+        AnthropicClient client,
+        IServiceScopeFactory scopeFactory,
+        IEnhancedCacheService cache,
+        ILogger<ClaudeService> logger) : IClaudeService
     {
-        private readonly AnthropicClient _client = client;
-        private readonly IMarketRepository _marketRepository = marketRepository;
-        private readonly ILogger<ClaudeService> _logger = logger;
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
@@ -43,6 +45,29 @@ namespace OddsTracker.Core.Services
             - "Lakers spread NBA" -> {"query_type": "game", "sport": "nba", "home_team": "Los Angeles Lakers", "away_team": null, "player_name": null, "market": "spread", "days_back": 3}
             - "Josh Allen first half passing" -> {"query_type": "player", "sport": "nfl", "home_team": null, "away_team": null, "player_name": "Josh Allen", "market": "first half passing yards", "days_back": 3}
             """;
+
+        #region Cached Repository Access
+
+        private async Task<MarketDefinition?> GetMarketByKeyAsync(string marketKey)
+        {
+            var cacheKey = $"market:bykey:{marketKey}";
+
+            var cached = await cache.GetAsync<MarketDefinition>(cacheKey);
+            if (cached is not null)
+                return cached;
+
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IMarketRepository>();
+
+            var market = await repo.GetMarketByKeyAsync(marketKey);
+
+            if (market is not null)
+                await cache.SetAsync(cacheKey, market, TimeSpan.FromHours(1));
+
+            return market;
+        }
+
+        #endregion
 
         public async Task<OddsQueryBase?> ParseQueryAsync(string userMessage)
         {
@@ -85,14 +110,14 @@ namespace OddsTracker.Core.Services
                     return null;
                 }
 
-                // Resolve market definition from database
+                // Resolve market definition from database (cached)
                 var marketKey = parsed.Market;
-                var market = await _marketRepository.GetMarketByKeyAsync(marketKey);
+                var market = await GetMarketByKeyAsync(marketKey);
 
                 if (market is null)
                 {
                     logger.LogWarning("Unknown market key: {MarketKey}, defaulting to spreads", marketKey);
-                    market = await _marketRepository.GetMarketByKeyAsync("spreads");
+                    market = await GetMarketByKeyAsync("spreads");
 
                     if (market is null)
                     {
@@ -103,7 +128,6 @@ namespace OddsTracker.Core.Services
 
                 var daysBack = parsed?.DaysBack ?? 3;
 
-                // Return appropriate query type based on parsed intent
                 if (parsed?.QueryType == "player" || !string.IsNullOrEmpty(parsed?.PlayerName))
                 {
                     if (string.IsNullOrEmpty(parsed?.PlayerName))
@@ -118,7 +142,7 @@ namespace OddsTracker.Core.Services
                         Sport = parsed.Sport,
                         DaysBack = daysBack,
                         PlayerName = parsed.PlayerName,
-                        Team = null // Can be resolved later by caller
+                        Team = null
                     };
                 }
 
@@ -188,17 +212,17 @@ namespace OddsTracker.Core.Services
             try
             {
                 var dataDescription = BuildOddsDataDescription(odds, query, side);
-                _logger.LogDebug("Sending odds data to Claude for analysis: {Data}", dataDescription);
+                logger.LogDebug("Sending odds data to Claude for analysis: {Data}", dataDescription);
 
                 var response = await CallClaudeAsync(OddsAnalysisPrompt, dataDescription, 200);
 
-                _logger.LogInformation("Claude analysis response: {Response}", response ?? "null");
+                logger.LogInformation("Claude analysis response: {Response}", response ?? "null");
 
                 return response ?? "Unable to generate analysis.";
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error generating odds analysis");
+                logger.LogError(ex, "Error generating odds analysis");
                 return "Analysis unavailable.";
             }
         }
@@ -207,7 +231,6 @@ namespace OddsTracker.Core.Services
         {
             var sb = new StringBuilder();
 
-            // Build header based on odds type
             switch (odds)
             {
                 case GameOdds game:
@@ -258,7 +281,6 @@ namespace OddsTracker.Core.Services
                 }
             }
 
-            // Calculate overall movement
             var allFirstValues = snapshotsByBook
                 .Select(g => g.OrderBy(s => s.Timestamp).FirstOrDefault())
                 .Where(s => s is not null)
@@ -323,7 +345,7 @@ namespace OddsTracker.Core.Services
                 ]
             };
 
-            var response = await _client.Messages.Create(parameters);
+            var response = await client.Messages.Create(parameters);
             var message = string.Join("", response.Content
                 .Where(m => m.Value is TextBlock)
                 .Select(m => (m.Value as TextBlock)?.Text));

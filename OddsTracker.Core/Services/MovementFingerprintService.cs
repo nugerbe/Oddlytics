@@ -1,6 +1,7 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using OddsTracker.Core.Models;
 using OddsTracker.Core.Interfaces;
+using OddsTracker.Core.Models;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -8,8 +9,8 @@ using System.Text.Json;
 namespace OddsTracker.Core.Services
 {
     public class MovementFingerprintService(
+        IServiceScopeFactory scopeFactory,
         IEnhancedCacheService cache,
-        IMarketRepository marketRepository,
         ILogger<MovementFingerprintService> logger) : IMovementFingerprintService
     {
         public async Task<MarketFingerprint> CreateFingerprintAsync(OddsBase odds, MarketFingerprint? previous)
@@ -130,12 +131,24 @@ namespace OddsTracker.Core.Services
         /// </summary>
         private async Task ClassifyBooksAsync(List<BookSnapshotBase> snapshots)
         {
-            // Try to get bookmaker info from database
-            var bookmakers = await marketRepository.GetAllBookmakersAsync();
-            var bookmakersByKey = bookmakers.ToDictionary(
-                b => b.Key,
-                b => b.Tier,
-                StringComparer.OrdinalIgnoreCase);
+            const string cacheKey = "bookmakers:all";
+
+            var bookmakersByKey = await cache.GetAsync<Dictionary<string, BookmakerTier>>(cacheKey);
+
+            if (bookmakersByKey is null)
+            {
+                await using var scope = scopeFactory.CreateAsyncScope();
+                var marketRepository = scope.ServiceProvider.GetRequiredService<IMarketRepository>();
+
+                var bookmakers = await marketRepository.GetAllBookmakersAsync();
+                bookmakersByKey = bookmakers.ToDictionary(
+                    b => b.Key,
+                    b => b.Tier,
+                    StringComparer.OrdinalIgnoreCase);
+
+                // Cache for 1 hour — bookmaker list rarely changes
+                await cache.SetAsync(cacheKey, bookmakersByKey, TimeSpan.FromHours(1));
+            }
 
             foreach (var snapshot in snapshots)
             {

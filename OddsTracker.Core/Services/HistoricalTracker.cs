@@ -12,6 +12,7 @@ namespace OddsTracker.Core.Services
     /// </summary>
     public class HistoricalTracker(
         IServiceScopeFactory scopeFactory,
+        IEnhancedCacheService cacheService,
         ILogger<HistoricalTracker> logger,
         IOptions<HistoricalTrackerOptions>? options = null) : IHistoricalTracker
     {
@@ -37,6 +38,9 @@ namespace OddsTracker.Core.Services
             using var scope = scopeFactory.CreateScope();
             var repository = scope.ServiceProvider.GetRequiredService<IHistoricalRepository>();
             await repository.SaveSignalAsync(snapshot);
+
+            // Invalidate cache so next read gets fresh data
+            await cacheService.RemoveAsync($"signals:{snapshot.EventId}:{snapshot.MarketKey}");
 
             logger.LogInformation(
                 "Recorded signal: {EventId} {MarketKey} Line={Line} Confidence={Confidence}",
@@ -67,6 +71,9 @@ namespace OddsTracker.Core.Services
                     outcome,
                     closingLine);
             }
+
+            // Invalidate cache after all updates
+            await cacheService.RemoveAsync($"signals:{eventId}:{marketKey}");
         }
 
         public async Task<PerformanceStats> GetPerformanceStatsAsync(DateTime from, DateTime to, SubscriptionTier tier)
@@ -82,13 +89,20 @@ namespace OddsTracker.Core.Services
             var earliestAllowed = DateTime.UtcNow.AddDays(-maxDaysBack);
             var effectiveFrom = from < earliestAllowed ? earliestAllowed : from;
 
+            // Cache key includes date range (rounded to hour for better hit rate)
+            var cacheKey = $"perfstats:{effectiveFrom:yyyyMMddHH}:{to:yyyyMMddHH}:{tier}";
+
+            var cached = await cacheService.GetAsync<PerformanceStats>(cacheKey);
+            if (cached is not null)
+                return cached;
+
             using var scope = scopeFactory.CreateScope();
             var repository = scope.ServiceProvider.GetRequiredService<IHistoricalRepository>();
 
             var signals = await repository.GetSignalsInRangeAsync(effectiveFrom, to);
             var completedSignals = signals.Where(s => s.Outcome.HasValue).ToList();
 
-            return new PerformanceStats
+            var stats = new PerformanceStats
             {
                 PeriodStart = effectiveFrom,
                 PeriodEnd = to,
@@ -99,6 +113,11 @@ namespace OddsTracker.Core.Services
                 ByConfidence = BuildConfidenceStats(completedSignals),
                 ByFirstMover = BuildFirstMoverStats(completedSignals)
             };
+
+            // Cache for 15 minutes — stats don't change frequently
+            await cacheService.SetAsync(cacheKey, stats, TimeSpan.FromMinutes(15));
+
+            return stats;
         }
 
         private static Dictionary<ConfidenceLevel, BucketStats> BuildConfidenceStats(List<SignalSnapshot> signals)

@@ -604,6 +604,12 @@ namespace OddsTracker.Core.Models
         public SportCategory Category { get; init; }
         public GamePeriodType PeriodType { get; init; }
         public bool IsActive { get; init; } = true;
+
+        /// <summary>
+        /// Code used in Sportsdata database (e.g., "NFL", "NBA") to link between databases
+        /// </summary>
+        public string? SportsdataCode { get; init; }
+
         public IReadOnlyList<MarketDefinition> AvailableMarkets { get; init; } = [];
 
         /// <summary>

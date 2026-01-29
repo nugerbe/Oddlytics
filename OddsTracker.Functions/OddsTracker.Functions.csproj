@@ -31,5 +31,6 @@
 
 	<ItemGroup>
 	  <ProjectReference Include="..\OddsTracker.Core\OddsTracker.Core.csproj" />
+	  <ProjectReference Include="..\Sportsdata.Core\Sportsdata.Core.csproj" />
 	</ItemGroup>
 </Project>

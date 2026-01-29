@@ -130,6 +130,12 @@ namespace OddsTracker.Core.Models
 
             public bool IsActive { get; set; } = true;
 
+            /// <summary>
+            /// Code used in Sportsdata database (e.g., "NFL", "NBA") to link between databases
+            /// </summary>
+            [MaxLength(20)]
+            public string? SportsdataCode { get; set; }
+
             [MaxLength(500)]
             public string? Keywords { get; set; }
 
@@ -147,6 +153,8 @@ namespace OddsTracker.Core.Models
                 Category = Enum.TryParse<SportCategory>(Category, true, out var cat) ? cat : SportCategory.Other,
                 PeriodType = Enum.TryParse<GamePeriodType>(PeriodType, true, out var pt) ? pt : GamePeriodType.None,
                 IsActive = IsActive,
+                SportsdataCode = SportsdataCode,
+                Keywords = string.IsNullOrEmpty(Keywords) ? [] : [.. Keywords.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)],
                 AvailableMarkets = [.. SportMarkets
                     .Where(sm => sm.IsActive && sm.MarketDefinition?.IsActive == true)
                     .Select(sm => sm.MarketDefinition!.ToModel())]

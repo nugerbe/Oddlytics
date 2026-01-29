@@ -1,90 +1,176 @@
-﻿using FantasyData.Api.Client;
-using FantasyData.Api.Client.Model.NFLv3;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using OddsTracker.Core.Models;
 using OddsTracker.Core.Interfaces;
+using System.Collections.Concurrent;
 
 namespace OddsTracker.Core.Services
 {
-    public class SportsDataService : ISportsDataService
+    /// <summary>
+    /// Sport-agnostic service for retrieving sports data using the ISportClientFactory
+    /// </summary>
+    public class SportsDataService(
+        ISportClientFactory clientFactory,
+        IEnhancedCacheService cache,
+        ILogger<SportsDataService> logger) : ISportsDataService
     {
-        private readonly NFLv3RotoBallerPremiumNewsClient _articlesClient;
-        private readonly NFLv3ScoresClient _scoresClient;
-        private readonly IEnhancedCacheService _cache;
-        private readonly ILogger<SportsDataService> _logger;
+        private readonly ISportClientFactory _clientFactory = clientFactory;
+        private readonly IEnhancedCacheService _cache = cache;
+        private readonly ILogger<SportsDataService> _logger = logger;
 
-        private Dictionary<string, string>? _teamAliases;
-        private Dictionary<string, PlayerTeamInfo>? _playerLookup;
+        // Per-sport caches
+        private readonly ConcurrentDictionary<string, Dictionary<string, string>> _teamAliasesCache = new();
+        private readonly ConcurrentDictionary<string, Dictionary<string, PlayerTeamInfo>> _playerLookupCache = new();
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _initLocks = new();
+        private readonly ConcurrentDictionary<string, bool> _initialized = new();
 
-        private readonly SemaphoreSlim _initLock = new(1, 1);
-        private bool _initialized;
-
-        private const string TeamCacheKey = "sportsdata:teamaliases";
-        private const string PlayerCacheKey = "sportsdata:players";
         private static readonly TimeSpan CacheTtl = TimeSpan.FromHours(24);
 
-        public SportsDataService(
-            IConfiguration config,
-            IEnhancedCacheService cache,
-            ILogger<SportsDataService> logger)
-        {
-            var apiKey = config["AppSettings:SportsDataApiKey"]
-                ?? throw new InvalidOperationException("SportsDataApiKey not configured");
+        public bool IsSportSupported(string sportKey) => _clientFactory.IsSupported(sportKey);
 
-            _articlesClient = new NFLv3RotoBallerPremiumNewsClient(apiKey);
-            _scoresClient = new NFLv3ScoresClient(apiKey);
-            _cache = cache;
-            _logger = logger;
-        }
+        public IEnumerable<string> GetSupportedSports() => _clientFactory.GetSupportedSports();
 
-        public async Task InitializeAsync()
+        public async Task InitializeAsync(string sportKey)
         {
-            if (_initialized)
+            var client = GetClientOrThrow(sportKey);
+            var normalizedKey = client.SportKey;
+
+            if (_initialized.GetValueOrDefault(normalizedKey))
                 return;
 
-            await _initLock.WaitAsync();
+            var initLock = _initLocks.GetOrAdd(normalizedKey, _ => new SemaphoreSlim(1, 1));
+
+            await initLock.WaitAsync();
             try
             {
-                if (_initialized)
+                if (_initialized.GetValueOrDefault(normalizedKey))
                     return;
 
+                _logger.LogInformation("Initializing SportsDataService for {Sport}...", normalizedKey);
+
                 // Load team aliases
-                _teamAliases = await GetTeamAliasesAsync();
-                _logger.LogInformation("Loaded {Count} team aliases", _teamAliases.Count);
+                var teamAliases = await GetTeamAliasesAsync(sportKey);
+                _logger.LogInformation("Loaded {Count} team aliases for {Sport}", teamAliases.Count, normalizedKey);
 
                 // Load all players
-                _playerLookup = await LoadAllPlayersAsync();
-                _logger.LogInformation("Loaded {Count} player profiles", _playerLookup.Count);
+                var playerLookup = await LoadAllPlayersAsync(client);
+                _playerLookupCache[normalizedKey] = playerLookup;
+                _logger.LogInformation("Loaded {Count} player profiles for {Sport}", playerLookup.Count, normalizedKey);
 
-                _initialized = true;
+                _initialized[normalizedKey] = true;
             }
             finally
             {
-                _initLock.Release();
+                initLock.Release();
             }
         }
 
-        public async Task<List<Score>> GetSeasonScores()
+        public async Task<List<GameInfo>> GetSeasonGamesAsync(string sportKey)
         {
-            var currentSeason = await _scoresClient.GetSeasonCurrentAsync();
-            return await _scoresClient.GetGamesBySeasonLiveFinalAsync(currentSeason.ToString());
+            var client = GetClientOrThrow(sportKey);
+            return await client.GetCurrentSeasonGamesAsync();
         }
 
-        public async Task<PlayerTeamInfo?> GetPlayerTeamAsync(string playerName)
+        public async Task<List<StadiumInfo>> GetStadiumsAsync(string sportKey)
+        {
+            var client = GetClientOrThrow(sportKey);
+            var cacheKey = $"sportsdata:{client.SportKey}:stadiums";
+
+            var cached = await _cache.GetAsync<List<StadiumInfo>>(cacheKey);
+            if (cached is not null)
+            {
+                _logger.LogDebug("Stadium lookup loaded from cache for {Sport}", client.SportKey);
+                return cached;
+            }
+
+            _logger.LogInformation("Fetching stadiums for {Sport} from SportsData API...", client.SportKey);
+
+            try
+            {
+                var stadiums = await client.GetStadiumsAsync();
+                await _cache.SetAsync(cacheKey, stadiums, CacheTtl);
+                _logger.LogInformation("Retrieved {Count} stadiums for {Sport}", stadiums.Count, client.SportKey);
+                return stadiums;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to fetch stadiums for {Sport}", client.SportKey);
+                return [];
+            }
+        }
+
+        public async Task<List<TeamInfo>> GetTeamsAsync(string sportKey)
+        {
+            var client = GetClientOrThrow(sportKey);
+            var cacheKey = $"sportsdata:{client.SportKey}:teams";
+
+            var cached = await _cache.GetAsync<List<TeamInfo>>(cacheKey);
+            if (cached is not null)
+            {
+                _logger.LogDebug("Teams loaded from cache for {Sport}", client.SportKey);
+                return cached;
+            }
+
+            _logger.LogInformation("Fetching teams for {Sport} from SportsData API...", client.SportKey);
+
+            try
+            {
+                var teams = await client.GetTeamsAsync();
+                await _cache.SetAsync(cacheKey, teams, CacheTtl);
+                _logger.LogInformation("Retrieved {Count} teams for {Sport}", teams.Count, client.SportKey);
+                return teams;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to fetch teams for {Sport}", client.SportKey);
+                return [];
+            }
+        }
+
+        public async Task<List<PlayerInfo>> GetPlayersAsync(string sportKey)
+        {
+            var client = GetClientOrThrow(sportKey);
+            var cacheKey = $"sportsdata:{client.SportKey}:players";
+
+            var cached = await _cache.GetAsync<List<PlayerInfo>>(cacheKey);
+            if (cached is not null)
+            {
+                _logger.LogDebug("Players loaded from cache for {Sport}", client.SportKey);
+                return cached;
+            }
+
+            _logger.LogInformation("Fetching players for {Sport} from SportsData API...", client.SportKey);
+
+            try
+            {
+                var players = await client.GetPlayersAsync();
+                await _cache.SetAsync(cacheKey, players, CacheTtl);
+                _logger.LogInformation("Retrieved {Count} players for {Sport}", players.Count, client.SportKey);
+                return players;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to fetch players for {Sport}", client.SportKey);
+                return [];
+            }
+        }
+
+        public async Task<PlayerTeamInfo?> GetPlayerTeamAsync(string sportKey, string playerName)
         {
             if (string.IsNullOrWhiteSpace(playerName))
                 return null;
 
+            var client = GetClientOrThrow(sportKey);
+            var normalizedKey = client.SportKey;
+
             // Ensure initialized
-            if (_playerLookup is null)
+            if (!_playerLookupCache.ContainsKey(normalizedKey))
             {
-                await InitializeAsync();
+                await InitializeAsync(sportKey);
             }
 
-            if (_playerLookup is null)
+            if (!_playerLookupCache.TryGetValue(normalizedKey, out var playerLookup))
             {
-                _logger.LogWarning("Player lookup not initialized");
+                _logger.LogWarning("Player lookup not initialized for {Sport}", normalizedKey);
                 return null;
             }
 
@@ -92,14 +178,14 @@ namespace OddsTracker.Core.Services
             var searchKey = NormalizePlayerName(playerName);
 
             // Direct match
-            if (_playerLookup.TryGetValue(searchKey, out var player))
+            if (playerLookup.TryGetValue(searchKey, out var player))
             {
                 _logger.LogDebug("Found player {Player} on {Team}", player.PlayerName, player.TeamFullName);
                 return player;
             }
 
             // Try partial match (last name only)
-            var lastNameMatch = _playerLookup.Values
+            var lastNameMatch = playerLookup.Values
                 .FirstOrDefault(p => p.PlayerName.Split(' ').LastOrDefault()
                     ?.Equals(playerName, StringComparison.OrdinalIgnoreCase) == true);
 
@@ -111,8 +197,7 @@ namespace OddsTracker.Core.Services
             }
 
             // Try contains match
-            var containsMatch = _playerLookup.Values
-                .FirstOrDefault(p => p.PlayerName.Contains(playerName, StringComparison.OrdinalIgnoreCase));
+            var containsMatch = playerLookup.Values.FirstOrDefault(p => p.PlayerName.Contains(playerName, StringComparison.OrdinalIgnoreCase));
 
             if (containsMatch is not null)
             {
@@ -121,38 +206,97 @@ namespace OddsTracker.Core.Services
                 return containsMatch;
             }
 
-            _logger.LogWarning("Player not found: {Player}", playerName);
+            _logger.LogWarning("Player not found: {Player} in {Sport}", playerName, normalizedKey);
             return null;
         }
 
-        private async Task<Dictionary<string, PlayerTeamInfo>> LoadAllPlayersAsync()
+        public async Task<Dictionary<string, string>> GetTeamAliasesAsync(string sportKey)
         {
-            // Try Redis cache first
-            var cached = await _cache.GetAsync<PlayerLookupCache>(PlayerCacheKey);
+            var client = GetClientOrThrow(sportKey);
+            var normalizedKey = client.SportKey;
+
+            // Return cached in-memory if available
+            if (_teamAliasesCache.TryGetValue(normalizedKey, out var cachedAliases))
+                return cachedAliases;
+
+            var cacheKey = $"sportsdata:{normalizedKey}:teamaliases";
+
+            // Try Redis cache
+            var cached = await _cache.GetAsync<TeamAliasCache>(cacheKey);
             if (cached is not null)
             {
-                _logger.LogDebug("Player lookup loaded from cache");
+                _logger.LogDebug("Team aliases loaded from cache for {Sport}", normalizedKey);
+                _teamAliasesCache[normalizedKey] = cached.Aliases;
+                return cached.Aliases;
+            }
+
+            // Fetch from API
+            _logger.LogInformation("Fetching team profiles for {Sport} from SportsData API", normalizedKey);
+            var teams = await client.GetTeamsAsync();
+
+            var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var team in teams)
+            {
+                var fullName = team.FullName;
+                if (string.IsNullOrEmpty(fullName))
+                    continue;
+
+                // Add various aliases for each team
+                aliases.TryAdd(fullName, fullName);
+
+                if (!string.IsNullOrEmpty(team.Key))
+                    aliases.TryAdd(team.Key, fullName);
+
+                if (!string.IsNullOrEmpty(team.Name))
+                    aliases.TryAdd(team.Name, fullName);
+
+                if (!string.IsNullOrEmpty(team.City))
+                    aliases.TryAdd(team.City, fullName);
+
+                // Add sport-specific common aliases
+                AddCommonAliases(aliases, team, fullName, normalizedKey);
+            }
+
+            // Cache the result
+            await _cache.SetAsync(cacheKey, new TeamAliasCache { Aliases = aliases }, CacheTtl);
+            _teamAliasesCache[normalizedKey] = aliases;
+
+            _logger.LogInformation("Loaded {Count} team aliases for {Sport}", aliases.Count, normalizedKey);
+            return aliases;
+        }
+
+        private async Task<Dictionary<string, PlayerTeamInfo>> LoadAllPlayersAsync(ISportClient client)
+        {
+            var normalizedKey = client.SportKey;
+            var cacheKey = $"sportsdata:{normalizedKey}:playerlookup";
+
+            // Try Redis cache first
+            var cached = await _cache.GetAsync<PlayerLookupCache>(cacheKey);
+            if (cached is not null)
+            {
+                _logger.LogDebug("Player lookup loaded from cache for {Sport}", normalizedKey);
                 return cached.Players;
             }
 
             // Fetch from API
-            _logger.LogInformation("Fetching all player profiles from SportsData API...");
+            _logger.LogInformation("Fetching all player profiles for {Sport} from SportsData API...", normalizedKey);
 
-            List<Player> players;
+            List<PlayerInfo> players;
             try
             {
-                players = await _scoresClient.GetPlayerDetailsAllAsync();
+                players = await client.GetPlayersAsync();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to fetch player profiles");
+                _logger.LogError(ex, "Failed to fetch player profiles for {Sport}", normalizedKey);
                 return new Dictionary<string, PlayerTeamInfo>(StringComparer.OrdinalIgnoreCase);
             }
 
-            _logger.LogInformation("Retrieved {Count} player profiles from API", players.Count);
+            _logger.LogInformation("Retrieved {Count} player profiles for {Sport}", players.Count, normalizedKey);
 
             // Get team aliases for full name lookup
-            var teamAliases = await GetTeamAliasesAsync();
+            var teamAliases = await GetTeamAliasesAsync(normalizedKey);
 
             var lookup = new Dictionary<string, PlayerTeamInfo>(StringComparer.OrdinalIgnoreCase);
 
@@ -178,7 +322,7 @@ namespace OddsTracker.Core.Services
                 var key = NormalizePlayerName(player.Name);
                 lookup.TryAdd(key, info);
 
-                // Also add by short name if different (e.g., "Josh Allen" for "Joshua Allen")
+                // Also add by short name if different
                 if (!string.IsNullOrEmpty(player.ShortName) && player.ShortName != player.Name)
                 {
                     var shortKey = NormalizePlayerName(player.ShortName);
@@ -187,7 +331,7 @@ namespace OddsTracker.Core.Services
             }
 
             // Cache the result
-            await _cache.SetAsync(PlayerCacheKey, new PlayerLookupCache { Players = lookup }, CacheTtl);
+            await _cache.SetAsync(cacheKey, new PlayerLookupCache { Players = lookup }, CacheTtl);
 
             return lookup;
         }
@@ -201,102 +345,135 @@ namespace OddsTracker.Core.Services
                 .Trim();
         }
 
-        public async Task<Dictionary<string, string>> GetTeamAliasesAsync()
+        private ISportClient GetClientOrThrow(string sportKey)
         {
-            // Return cached in-memory if available
-            if (_teamAliases is not null)
-                return _teamAliases;
-
-            // Try Redis cache
-            var cached = await _cache.GetAsync<TeamAliasCache>(TeamCacheKey);
-            if (cached is not null)
+            var client = _clientFactory.GetClient(sportKey);
+            if (client is null)
             {
-                _logger.LogDebug("Team aliases loaded from cache");
-                _teamAliases = cached.Aliases;
-                return _teamAliases;
+                throw new NotSupportedException($"Sport '{sportKey}' is not supported. Supported sports: {string.Join(", ", _clientFactory.GetSupportedSports())}");
             }
+            return client;
+        }
 
-            // Fetch from API
-            _logger.LogInformation("Fetching team profiles from SportsData API");
-            var teams = await _scoresClient.GetTeamProfilesAllAsync();
-
-            var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var team in teams)
+        private static void AddCommonAliases(Dictionary<string, string> aliases, TeamInfo team, string fullName, string sportKey)
+        {
+            // NFL-specific aliases
+            if (sportKey == "americanfootball_nfl")
             {
-                var fullName = team.FullName;
-                if (string.IsNullOrEmpty(fullName))
-                    continue;
+                var nflAliases = team.Key?.ToUpperInvariant() switch
+                {
+                    "NE" => new[] { "pats", "new england" },
+                    "KC" => new[] { "kc", "kansas city" },
+                    "TB" => new[] { "bucs", "tampa", "tampa bay" },
+                    "GB" => new[] { "green bay" },
+                    "NO" => new[] { "new orleans" },
+                    "LV" => new[] { "vegas", "las vegas" },
+                    "LAC" => new[] { "la chargers" },
+                    "LAR" => new[] { "la rams" },
+                    "SF" => new[] { "niners", "sf", "san francisco" },
+                    "JAX" => new[] { "jags" },
+                    "IND" => new[] { "indy" },
+                    "CIN" => new[] { "cincy" },
+                    "PHI" => new[] { "philly" },
+                    "NYG" => new[] { "ny giants" },
+                    "NYJ" => new[] { "ny jets" },
+                    _ => Array.Empty<string>()
+                };
 
-                // Add various aliases for each team
-                aliases.TryAdd(fullName, fullName);
-
-                if (!string.IsNullOrEmpty(team.Key))
-                    aliases.TryAdd(team.Key, fullName);
-
-                if (!string.IsNullOrEmpty(team.Name))
-                    aliases.TryAdd(team.Name, fullName);
-
-                if (!string.IsNullOrEmpty(team.City))
-                    aliases.TryAdd(team.City, fullName);
-
-                AddCommonAliases(aliases, team, fullName);
+                foreach (var alias in nflAliases)
+                    aliases.TryAdd(alias, fullName);
             }
-
-            // Cache the result
-            await _cache.SetAsync(TeamCacheKey, new TeamAliasCache { Aliases = aliases }, CacheTtl);
-            _teamAliases = aliases;
-
-            _logger.LogInformation("Loaded {Count} team aliases from API", aliases.Count);
-            return aliases;
-        }
-
-        public async Task<List<News>> GetArticlesByTeam(string team)
-        {
-            return await _articlesClient.GetPremiumNewsByTeamAsync(team);
-        }
-
-        public async Task<List<News>> GetArticlesByPlayer(int playerId)
-        {
-            return await _articlesClient.GetPremiumNewsByPlayerAsync(playerId);
-        }
-
-        private static void AddCommonAliases(Dictionary<string, string> aliases, Team team, string fullName)
-        {
-            var commonAliases = team.Key?.ToUpperInvariant() switch
+            // NBA-specific aliases
+            else if (sportKey == "basketball_nba")
             {
-                "NE" => ["pats", "new england"],
-                "KC" => new[] { "kc", "kansas city" },
-                "TB" => new[] { "bucs", "tampa", "tampa bay" },
-                "GB" => new[] { "green bay" },
-                "NO" => new[] { "new orleans" },
-                "LV" => new[] { "vegas", "las vegas" },
-                "LAC" => new[] { "la chargers" },
-                "LAR" => new[] { "la rams" },
-                "SF" => new[] { "niners", "sf", "san francisco" },
-                "JAX" => new[] { "jags" },
-                "IND" => new[] { "indy" },
-                "CIN" => new[] { "cincy" },
-                "PHI" => new[] { "philly" },
-                "NYG" => new[] { "ny giants" },
-                "NYJ" => new[] { "ny jets" },
-                _ => Array.Empty<string>()
-            };
+                var nbaAliases = team.Key?.ToUpperInvariant() switch
+                {
+                    "LAL" => new[] { "lakers", "la lakers" },
+                    "LAC" => new[] { "clippers", "la clippers" },
+                    "GSW" => new[] { "warriors", "golden state", "dubs" },
+                    "BOS" => new[] { "celtics" },
+                    "NYK" => new[] { "knicks" },
+                    "BKN" => new[] { "nets", "brooklyn" },
+                    "PHI" => new[] { "sixers", "76ers" },
+                    "MIA" => new[] { "heat" },
+                    "CHI" => new[] { "bulls" },
+                    "CLE" => new[] { "cavs", "cavaliers" },
+                    "DET" => new[] { "pistons" },
+                    "MIL" => new[] { "bucks" },
+                    "OKC" => new[] { "thunder" },
+                    "DAL" => new[] { "mavs", "mavericks" },
+                    "HOU" => new[] { "rockets" },
+                    "SAS" => new[] { "spurs" },
+                    "PHX" => new[] { "suns" },
+                    "DEN" => new[] { "nuggets" },
+                    "MIN" => new[] { "wolves", "timberwolves" },
+                    _ => Array.Empty<string>()
+                };
 
-            foreach (var alias in commonAliases)
+                foreach (var alias in nbaAliases)
+                    aliases.TryAdd(alias, fullName);
+            }
+            // MLB-specific aliases
+            else if (sportKey == "baseball_mlb")
             {
-                aliases.TryAdd(alias, fullName);
+                var mlbAliases = team.Key?.ToUpperInvariant() switch
+                {
+                    "NYY" => new[] { "yankees", "bronx bombers" },
+                    "NYM" => new[] { "mets" },
+                    "BOS" => new[] { "red sox", "sox" },
+                    "LAD" => new[] { "dodgers" },
+                    "LAA" => new[] { "angels" },
+                    "CHC" => new[] { "cubs", "cubbies" },
+                    "CHW" => new[] { "white sox" },
+                    "SF" => new[] { "giants" },
+                    "HOU" => new[] { "astros", "stros" },
+                    "ATL" => new[] { "braves" },
+                    "PHI" => new[] { "phillies" },
+                    "SD" => new[] { "padres" },
+                    "SEA" => new[] { "mariners" },
+                    "TEX" => new[] { "rangers" },
+                    "STL" => new[] { "cardinals", "cards" },
+                    _ => Array.Empty<string>()
+                };
+
+                foreach (var alias in mlbAliases)
+                    aliases.TryAdd(alias, fullName);
+            }
+            // NHL-specific aliases
+            else if (sportKey == "icehockey_nhl")
+            {
+                var nhlAliases = team.Key?.ToUpperInvariant() switch
+                {
+                    "TOR" => new[] { "leafs", "maple leafs" },
+                    "MTL" => new[] { "habs", "canadiens" },
+                    "BOS" => new[] { "bruins" },
+                    "NYR" => new[] { "rangers" },
+                    "NYI" => new[] { "islanders" },
+                    "CHI" => new[] { "blackhawks", "hawks" },
+                    "DET" => new[] { "red wings", "wings" },
+                    "PIT" => new[] { "penguins", "pens" },
+                    "PHI" => new[] { "flyers" },
+                    "VGK" => new[] { "golden knights", "vegas" },
+                    "SEA" => new[] { "kraken" },
+                    "COL" => new[] { "avalanche", "avs" },
+                    "TB" => new[] { "lightning", "bolts" },
+                    "EDM" => new[] { "oilers" },
+                    _ => Array.Empty<string>()
+                };
+
+                foreach (var alias in nhlAliases)
+                    aliases.TryAdd(alias, fullName);
             }
         }
     }
 
     public class TeamAliasCache
     {
-        public Dictionary<string, string> Aliases { get; set; } = new();
+        public Dictionary<string, string> Aliases { get; set; } = [];
     }
 
     public class PlayerLookupCache
     {
-        public Dictionary<string, PlayerTeamInfo> Players { get; set; } = new();
+        public Dictionary<string, PlayerTeamInfo> Players { get; set; } = [];
     }
 }

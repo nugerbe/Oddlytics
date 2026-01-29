@@ -1,9 +1,8 @@
-﻿using FantasyData.Api.Client.Model.NFLv3;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OddsTracker.Core.Interfaces;
 using OddsTracker.Core.Models;
-using System.Threading.Tasks;
 
 namespace OddsTracker.Functions.Functions
 {
@@ -14,18 +13,20 @@ namespace OddsTracker.Functions.Functions
     public class OutcomeUpdateFunction(
         IOddsApiClient oddsClient,
         ISportsDataService sportsDataService,
-        IMarketRepository marketRepository,
+        IServiceScopeFactory scopeFactory,
         IHistoricalTracker historicalTracker,
         IEnhancedCacheService cache,
         ILogger<OutcomeUpdateFunction> logger)
     {
-        /// <summary>
         /// Timer trigger: runs every 15 minutes
         /// CRON: "0 */15 * * * *" = at minute 0, 15, 30, 45 of every hour
         /// </summary>
         [Function("OutcomeUpdate")]
-        public async Task Run(
-            [TimerTrigger("0 */15 * * * *")] MyTimerInfo timerInfo)
+#if DEBUG
+        public async Task Run([TimerTrigger("0 */15 * * * *", RunOnStartup = true)] MyTimerInfo timerInfo)
+#else
+        public async Task Run([TimerTrigger("0 */15 * * * *")] MyTimerInfo timerInfo)
+#endif
         {
             logger.LogInformation("OutcomeUpdate function triggered at {Time}", DateTime.UtcNow);
 
@@ -47,8 +48,7 @@ namespace OddsTracker.Functions.Functions
 
         private async Task UpdateOutcomesAsync()
         {
-            var sports = await marketRepository.GetAllSportsAsync();
-            var activeSports = sports.Where(s => s.IsActive).ToList();
+            var activeSports = await GetActiveSportsAsync();
 
             var totalProcessed = 0;
             var totalUpdated = 0;
@@ -72,17 +72,19 @@ namespace OddsTracker.Functions.Functions
                     logger.LogInformation("Processing {Count} completed games for {Sport}",
                         completedGames.Count, sport.Key);
 
-                    // Get all non-player-prop, non-alternate markets for this sport
-                    var sportMarkets = await marketRepository.GetMarketsForSportAsync(sport.Key);
+                    var sportMarkets = await GetMarketsForSportAsync(sport.Key);
                     var trackableMarkets = sportMarkets
                         .Where(m => !m.IsPlayerProp && !m.IsAlternate)
                         .ToDictionary(m => m.Key, StringComparer.OrdinalIgnoreCase);
+
+                    // Pre-fetch sport-specific game data for period scores
+                    var sportGames = await GetSportGamesAsync(sport.Key);
 
                     foreach (var game in completedGames)
                     {
                         try
                         {
-                            var gameUpdates = await ProcessCompletedGameAsync(game, trackableMarkets);
+                            var gameUpdates = await ProcessCompletedGameAsync(game, trackableMarkets, sport.Key, sportGames);
                             totalProcessed++;
                             totalUpdated += gameUpdates;
                         }
@@ -103,9 +105,24 @@ namespace OddsTracker.Functions.Functions
                 totalProcessed, totalUpdated);
         }
 
+        private async Task<List<GameInfo>> GetSportGamesAsync(string sportKey)
+        {
+            try
+            {
+                return await sportsDataService.GetSeasonGamesAsync(sportKey);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to fetch sport games for {Sport}", sportKey);
+                return [];
+            }
+        }
+
         private async Task<int> ProcessCompletedGameAsync(
             ScoreEvent game,
-            Dictionary<string, MarketDefinition> marketsByKey)
+            Dictionary<string, MarketDefinition> marketsByKey,
+            string sportKey,
+            List<GameInfo> sportGames)
         {
             var updatedCount = 0;
 
@@ -117,7 +134,7 @@ namespace OddsTracker.Functions.Functions
                 if (closingLineWrapper is null)
                     continue;
 
-                var outcome = await DetermineOutcome(game, market, closingLineWrapper.ClosingLine);
+                var outcome = DetermineOutcome(game, market, closingLineWrapper.ClosingLine, sportGames);
 
                 if (outcome.HasValue)
                 {
@@ -141,23 +158,21 @@ namespace OddsTracker.Functions.Functions
             return updatedCount;
         }
 
-        private async Task<SignalOutcome?> DetermineOutcome(
+        private SignalOutcome? DetermineOutcome(
             ScoreEvent game,
             MarketDefinition market,
-            decimal closingLine)
+            decimal closingLine,
+            List<GameInfo> sportGames)
         {
-            // Get scores for full game
             var scores = GetScores(game);
             if (scores is null)
                 return null;
 
             var (homeScore, awayScore) = scores.Value;
 
-            // Handle period-specific markets
             if (market.Period is not null)
             {
-                var sportsdataScores = await sportsDataService.GetSeasonScores();
-                var periodScores = GetPeriodScores(game, (GamePeriod)market.Period, sportsdataScores);
+                var periodScores = GetPeriodScores(game, (GamePeriod)market.Period, sportGames);
                 if (periodScores is null)
                 {
                     logger.LogDebug("No period scores available for {Market}", market.Key);
@@ -183,7 +198,6 @@ namespace OddsTracker.Functions.Functions
 
         private static SignalOutcome DetermineOverUnderOutcome(int totalScore, decimal closingLine, MarketDefinition market)
         {
-            // Team totals use individual team score, not combined
             if (market.Key.Contains("team_total", StringComparison.OrdinalIgnoreCase))
             {
                 // For team totals, closingLine is for a specific team
@@ -191,51 +205,47 @@ namespace OddsTracker.Functions.Functions
             }
 
             if (totalScore > closingLine)
-                return SignalOutcome.Extended;  // Over hit
+                return SignalOutcome.Extended;
             if (totalScore < closingLine)
-                return SignalOutcome.Reverted;  // Under hit
+                return SignalOutcome.Reverted;
 
-            return SignalOutcome.Stable;  // Push
+            return SignalOutcome.Stable;
         }
 
         private static SignalOutcome DetermineTeamBasedOutcome(int margin, decimal closingLine, MarketDefinition market)
         {
-            // Spreads - margin vs point spread
             if (market.Key.Contains("spread", StringComparison.OrdinalIgnoreCase) ||
                 market.Key.Contains("handicap", StringComparison.OrdinalIgnoreCase))
             {
                 var adjustedMargin = margin + closingLine;
 
                 if (adjustedMargin > 0)
-                    return SignalOutcome.Extended;  // Home covered
+                    return SignalOutcome.Extended;
                 if (adjustedMargin < 0)
-                    return SignalOutcome.Reverted;  // Away covered
+                    return SignalOutcome.Reverted;
 
-                return SignalOutcome.Stable;  // Push
+                return SignalOutcome.Stable;
             }
 
-            // Moneylines (h2h) - winner vs favorite
             if (market.Key.Contains("h2h", StringComparison.OrdinalIgnoreCase) ||
                 market.Key.Contains("moneyline", StringComparison.OrdinalIgnoreCase))
             {
                 var homeWon = margin > 0;
                 var homeWasFavorite = closingLine < 0;
 
-                // Tie handling (for sports that allow ties)
                 if (margin == 0)
                     return SignalOutcome.Stable;
 
                 if (homeWon == homeWasFavorite)
-                    return SignalOutcome.Stable;  // Favorite won
+                    return SignalOutcome.Stable;
 
-                return SignalOutcome.Reverted;  // Upset
+                return SignalOutcome.Reverted;
             }
 
-            // Draw no bet
             if (market.Key.Contains("draw_no_bet", StringComparison.OrdinalIgnoreCase))
             {
                 if (margin == 0)
-                    return SignalOutcome.Stable;  // Draw = push
+                    return SignalOutcome.Stable;
 
                 var homeWon = margin > 0;
                 var homeWasFavorite = closingLine < 0;
@@ -243,13 +253,11 @@ namespace OddsTracker.Functions.Functions
                 return homeWon == homeWasFavorite ? SignalOutcome.Stable : SignalOutcome.Reverted;
             }
 
-            // Default team-based (treat as moneyline)
             return margin > 0 ? SignalOutcome.Extended : SignalOutcome.Reverted;
         }
 
         private SignalOutcome DetermineYesNoOutcome(ScoreEvent game, decimal closingLine, MarketDefinition market)
         {
-            // BTTS (Both Teams to Score)
             if (market.Key.Contains("btts", StringComparison.OrdinalIgnoreCase))
             {
                 var scores = GetScores(game);
@@ -257,8 +265,6 @@ namespace OddsTracker.Functions.Functions
                     return SignalOutcome.Stable;
 
                 var bothScored = scores.Value.HomeScore > 0 && scores.Value.AwayScore > 0;
-
-                // closingLine > 0 means "Yes" was favorite
                 var yesBet = closingLine > 0;
 
                 if (bothScored == yesBet)
@@ -267,15 +273,12 @@ namespace OddsTracker.Functions.Functions
                 return SignalOutcome.Reverted;
             }
 
-            // Overtime
             if (market.Key.Contains("overtime", StringComparison.OrdinalIgnoreCase))
             {
-                // Would need OT data from scores API
                 logger.LogDebug("Overtime outcome determination not implemented for {Market}", market.Key);
                 return SignalOutcome.Stable;
             }
 
-            // Odd/Even total
             if (market.Key.Contains("odd_even", StringComparison.OrdinalIgnoreCase))
             {
                 var scores = GetScores(game);
@@ -285,8 +288,7 @@ namespace OddsTracker.Functions.Functions
                 var total = scores.Value.HomeScore + scores.Value.AwayScore;
                 var isOdd = total % 2 == 1;
 
-                // closingLine indicates which was favored
-                return SignalOutcome.Stable;  // Hard to determine without knowing bet side
+                return SignalOutcome.Stable;
             }
 
             return SignalOutcome.Stable;
@@ -294,15 +296,11 @@ namespace OddsTracker.Functions.Functions
 
         private static SignalOutcome DetermineNamedOutcome(int margin, decimal closingLine, MarketDefinition market)
         {
-            // 3-way markets (includes draw)
             if (market.Key.Contains("3_way", StringComparison.OrdinalIgnoreCase) ||
                 market.Key.Contains("3way", StringComparison.OrdinalIgnoreCase))
             {
-                // For 3-way, closingLine might represent home odds
-                // Draw outcome needs special handling
                 if (margin == 0)
                 {
-                    // Draw occurred - typically this means signals on home/away reverted
                     return SignalOutcome.Reverted;
                 }
 
@@ -312,10 +310,8 @@ namespace OddsTracker.Functions.Functions
                 return homeWon == homeWasFavorite ? SignalOutcome.Stable : SignalOutcome.Reverted;
             }
 
-            // Double chance (1X, X2, 12)
             if (market.Key.Contains("double_chance", StringComparison.OrdinalIgnoreCase))
             {
-                // Would need to know which double chance bet
                 return SignalOutcome.Stable;
             }
 
@@ -341,75 +337,67 @@ namespace OddsTracker.Functions.Functions
             return (homeScore, awayScore);
         }
 
-        /// <summary>
-        /// Gets period-specific scores from FantasyData Score object.
-        /// Matches game by team names and extracts quarter/half scores based on period.
-        /// </summary>
         private static (int HomeScore, int AwayScore)? GetPeriodScores(
             ScoreEvent game,
             GamePeriod period,
-            List<Score> detailedScores)
+            List<GameInfo> sportGames)
         {
-            // Find matching game in detailed scores
-            var matchingGame = detailedScores.FirstOrDefault(s =>
-                (s.HomeTeam?.Equals(game.HomeTeam, StringComparison.OrdinalIgnoreCase) == true &&
-                s.AwayTeam?.Equals(game.AwayTeam, StringComparison.OrdinalIgnoreCase) == true));
+            // Find matching game from sport-specific data
+            var matchingGame = sportGames.FirstOrDefault(g =>
+                g.HomeTeam?.Equals(game.HomeTeam, StringComparison.OrdinalIgnoreCase) == true &&
+                g.AwayTeam?.Equals(game.AwayTeam, StringComparison.OrdinalIgnoreCase) == true);
 
             if (matchingGame is null)
                 return null;
 
+            // Period scores require sport-specific data that our unified GameInfo doesn't have
+            // For now, we use the full game score from our unified model
+            // A future enhancement could add period scoring to ISportClient
             return period switch
             {
-                // Quarter scores (NFL, NBA)
-                GamePeriod.FirstQuarter => GetQuarterScore(matchingGame, 1),
-                GamePeriod.SecondQuarter => GetQuarterScore(matchingGame, 2),
-                GamePeriod.ThirdQuarter => GetQuarterScore(matchingGame, 3),
-                GamePeriod.FourthQuarter => GetQuarterScore(matchingGame, 4),
-
-                // Half scores (sum of quarters)
-                GamePeriod.FirstHalf => SumQuarterScores(matchingGame, new[] { 1, 2 }),
-                GamePeriod.SecondHalf => SumQuarterScores(matchingGame, new[] { 3, 4 }),
-
-                // Period scores (NHL) - mapped to quarters for NFL data
-                GamePeriod.FirstPeriod => GetQuarterScore(matchingGame, 1),
-                GamePeriod.SecondPeriod => GetQuarterScore(matchingGame, 2),
-                GamePeriod.ThirdPeriod => GetQuarterScore(matchingGame, 3),
-
-                // Overtime
-                GamePeriod.Overtime => (matchingGame.HomeScoreOvertime ?? 0, matchingGame.AwayScoreOvertime ?? 0),
-
+                GamePeriod.FullGame => (matchingGame.HomeScore ?? 0, matchingGame.AwayScore ?? 0),
+                // Period-specific scores would require extending GameInfo with period data
                 _ => null
             };
         }
 
-        private static (int HomeScore, int AwayScore)? GetQuarterScore(Score game, int quarter)
+        #endregion
+
+        #region Cached Repository Access
+
+        private async Task<List<Sport>> GetActiveSportsAsync()
         {
-            return quarter switch
-            {
-                1 => (game.HomeScoreQuarter1 ?? 0, game.AwayScoreQuarter1 ?? 0),
-                2 => (game.HomeScoreQuarter2 ?? 0, game.AwayScoreQuarter2 ?? 0),
-                3 => (game.HomeScoreQuarter3 ?? 0, game.AwayScoreQuarter3 ?? 0),
-                4 => (game.HomeScoreQuarter4 ?? 0, game.AwayScoreQuarter4 ?? 0),
-                _ => null
-            };
+            const string cacheKey = "sports:active";
+
+            var cached = await cache.GetAsync<List<Sport>>(cacheKey);
+            if (cached is not null)
+                return cached;
+
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IMarketRepository>();
+
+            var sports = await repo.GetAllSportsAsync();
+            var active = sports.Where(s => s.IsActive).ToList();
+
+            await cache.SetAsync(cacheKey, active, TimeSpan.FromMinutes(30));
+            return active;
         }
 
-        private static (int HomeScore, int AwayScore)? SumQuarterScores(Score game, int[] quarters)
+        private async Task<List<MarketDefinition>> GetMarketsForSportAsync(string sportKey)
         {
-            var homeTotal = 0;
-            var awayTotal = 0;
+            var cacheKey = $"markets:sport:{sportKey}";
 
-            foreach (var quarter in quarters)
-            {
-                var quarterScore = GetQuarterScore(game, quarter);
-                if (quarterScore is null)
-                    return null;
+            var cached = await cache.GetAsync<List<MarketDefinition>>(cacheKey);
+            if (cached is not null)
+                return cached;
 
-                homeTotal += quarterScore.Value.HomeScore;
-                awayTotal += quarterScore.Value.AwayScore;
-            }
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IMarketRepository>();
 
-            return (homeTotal, awayTotal);
+            var markets = await repo.GetMarketsForSportAsync(sportKey);
+
+            await cache.SetAsync(cacheKey, markets, TimeSpan.FromHours(1));
+            return markets;
         }
 
         #endregion
